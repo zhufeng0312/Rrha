@@ -1,0 +1,90 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Widget Preview related
+.widget_preview/
+
+# ---------------------------------------------------------------- 本项目补充
+# 以下每条都对应真机验收/交接时实际踩到的问题，不是模板默认项。
+
+# local.properties 里是本机绝对路径（sdk.dir / flutter.sdk），
+# 换机器必须重新生成。提交它只会让别人的构建直接失败。
+/android/local.properties
+
+# Gradle 构建缓存（实测 4.3 MB，会随构建持续膨胀，可安全重建）
+/android/.gradle/
+/android/.kotlin/
+
+# 已通过真机验收的 APK。保留在磁盘上供直接安装验证（dist/rrha-0.1.0-profile-arm64.apk），
+# 但 137 MB 的二进制不适合纳入版本管理；需要时用 gradlew assembleProfile 重建。
+/dist/
+
+# 构建环境缓存目录，由 tools/flutter-env.ps1 创建
+/.env/
+
+# Flutter 每次构建自动生成，不是源码
+/android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
+
+# 登录验证脚本产出的凭据，绝不允许提交。
+# 项目约定：任何 Cookie / Token 只能写入系统钥匙串。
+# App 侧的凭据唯一落点是 lib/core/storage/bili_credential_store.dart。
+**/session.json
+**/cookies.json
+**/*.session.json
+
+# 真机验收截图：574 张 PNG，共 453 MB。
+# 它们是「当时的证据」，不是源码 —— 需要看证据时去 docs/HANDOVER.md 里
+# 对应小节，截图本身留在本机即可。提交进仓库会让 clone 变成本小时级。
+/tools/shots/
+
+# UI 预览渲染产物（tools/preview/ui_preview_test.dart 跑出来的图）。
+# 保留那个 .dart 脚本（可复现），但图是生成物，每次跑都可能不同。
+/tools/preview/shots/
+
+# Python 探针脚本的运行产物
+/tools/__pycache__/
+/tools/tmp/
+*.pyc

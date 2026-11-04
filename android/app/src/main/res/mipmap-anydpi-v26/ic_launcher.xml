@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 自适应图标（Android 8.0 / API 26+）。
+     背景是纯白：源图是黑线白底线稿，白底能保持线条对比度（用户 2026-11-01 拍板）。
+     前景 ic_launcher_foreground.png 的主体落在中央 72/108 安全区内，
+     所以无论系统把图标裁成圆形、方形还是水滴形，都不会切到人物。 -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+</adaptive-icon>

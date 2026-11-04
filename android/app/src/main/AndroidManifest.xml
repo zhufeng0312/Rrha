@@ -1,0 +1,72 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 聚合时间线必须访问 Bilibili / Weibo / RSSHub。
+         注意：flutter create 只在 src/debug 与 src/profile 的 manifest 里声明
+         INTERNET（那是给 hot reload 用的），release 包不会继承，
+         所以这里必须显式声明，否则正式包完全无法联网。 -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <!-- 「保存图片到相册」在 Android 9 及以下需要写入外部存储；
+         10+ 走 MediaStore 不需要任何权限，所以用 maxSdkVersion 限定，
+         避免在高版本上申请一个注定被拒的权限（那会让用户以为 App 在乱要权限）。 -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"/>
+
+    <application
+        android:label="Rrha"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- Specifies an Android theme to apply to this Activity as soon as
+                 the Android process has started. This theme is visible to the user
+                 while the Flutter UI initializes. After that, this theme continues
+                 to determine the Window background behind the Flutter UI. -->
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+        <!-- Don't delete the meta-data below.
+             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+
+        <!-- 关闭 Impeller，回退 Skia 渲染。
+             为什么：media_kit 的 libmpv 通过 Flutter 纹理输出画面，在 Impeller 后端下
+             只出**黑屏**——视频地址拿到了、libmpv 零报错、画面永远转圈。这与 media-kit
+             官方 issue #707 的记录一致（原文大意：开启 Impeller 时 Android 端视频黑屏）。
+             实测机型：荣耀 Magic8 Pro / Android 16 / MagicOS 10，日志明确是
+             "Using the Impeller rendering backend (Vulkan)"；同一份代码在 Android 10
+             的旧机（未启用 Vulkan 后端）上通道 B 播放正常。
+             本 App 界面简单，Skia 与 Impeller 的观感差异可忽略，换来的是通道 B
+             （DASH/libmpv）能正常播放——通道 A 失败时它是唯一的兜底路径。
+             注意：XML 注释里不能出现连续两个减号，故此处不写命令行长参数原文。 -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="false" />
+    </application>
+    <!-- Required to query activities that can process text, see:
+         https://developer.android.com/training/package-visibility and
+         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
+
+         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+    </queries>
+</manifest>
