@@ -88,3 +88,7 @@ app.*.map.json
 /tools/__pycache__/
 /tools/tmp/
 *.pyc
+
+# 本地备份文件（如精简文档前留的全文备份），不进仓库
+*.bak
+*.orig

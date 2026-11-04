@@ -110,7 +110,7 @@ adb install -r build/app/outputs/flutter-apk/app-profile.apk
 > 已验证不可行（实例全灭，且无法满足「电脑关机也能用」），现为
 > **「App 内登录 + 直连平台官方接口」**。RSSHub 的客户端、解析器与设置项
 > **已于 2026-10-22 整体移除** —— 它早在官方接口落地时就已成不可达死代码
-> （详见 [HANDOVER §7.24](docs/HANDOVER.md)）。
+> （详见 [HANDOVER §7.6](docs/HANDOVER.md)）。
 > 下方「实测结论」「决策记录」里的 RSSHub 段落保留为**历史依据**，不再代表当前实现。
 
 最初计划验证的四件事，结论如下：
@@ -124,36 +124,27 @@ adb install -r build/app/outputs/flutter-apk/app-profile.apk
 
 ---
 
-## ✅ 验证状态（2026-10-14 更新：已完成真机验收）
+## ✅ 验证状态
 
 **这份代码已经过联网实测、真实编译与真机验收，不是「未编译的草稿」。**
 
-| 验证项                                                  | 结果                                                                                                                                            |
-| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `flutter pub get`                                    | ✅ 依赖全部解析成功（Flutter 3.47.7 / Dart 3.13.5；第二轮新增 `gal: ^2.3.3` 用于保存到相册，第三轮**零新增依赖**）                                                                            |
-| `dart analyze`                                       | ✅ **No issues found**（0 error / 0 warning / 0 info）                                                                                           |
-| `flutter test`                                       | ✅ **1313 个测试全部通过**（2026-11-02；含阶段 1 登录、阶段 2、四轮缺陷修复、PCDN 节点与音轨、微博评论多图、B 站播放页补全、**B 站评论配图与动态链路**、**动态详情页排版统一**。注：2026-10-22 移除 RSSHub 路线时删过 `rss_parser_test.dart`（解析器已不存在））                                                                |
-| 线上接口                                                 | ✅ 已逐条实测，并按真实形态修正了代码（见下节）                                                                                                                      |
-| **真机验收**                                             | ✅ 见 **[docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)**（华为 P40 Pro）                                                                                  |
-| **阶段 1：扫码登录**                                        | ✅ **真机验证通过**（2026-10-15，华为 P40 Pro）：App 内本地二维码 → 扫码 → 凭据写入系统钥匙串 → **杀进程冷启动仍能恢复登录态**                                                           |
-| **阶段 2：关注列表 → 时间线**                                  | ✅ **真机验证通过**（2026-10-15）：从关注列表（**74 人**）导入订阅，时间线聚合到 **151 条 · 6 个订阅源**（投稿 + 动态，按 id 去重），不再依赖公共 RSSHub 实例。详见 [HANDOVER §7.6](docs/HANDOVER.md) |
-| **一轮缺陷修复：五项**（评论翻页 / HTTP 412 / 播放状态 / 动态评论 / 时间线分页） | ✅ **真机验证通过**（2026-10-16）：评论可翻页、412 有专属文案且自动重试、打开视频即播放且弹幕立即滚动、B 站动态能看评论、时间线首屏 **20 条**且滚到底续拉（199 条）。详见 [HANDOVER §7.7](docs/HANDOVER.md)       |
-| **一轮缺陷修复（第二轮）：三项**（图片不能点开 / 多图只显示第一张 / 转发看不到原动态） | ✅ **真机验证通过**（2026-10-16）：图片可点开全屏预览（双指缩放、双击 2.5x、左右滑动、页码 `5 / 9`）、9 图动态以**九宫格**完整展示、转发动态下方有**「原动态」区块**且可跳独立页、保存到相册落在 `Pictures/Rrha/`。详见 [HANDOVER §7.8](docs/HANDOVER.md) |
-| **一轮缺陷修复（第三轮）：三项**（弹幕字号不可调 / 控制栏无法隐藏 / 封面滚回重新加载） | ✅ **真机验证通过**（2026-10-16）：弹幕字号四档（小/中/大/特大）可调且**实时生效、冷启动保持**；控制栏单击显隐 + **3 秒自动隐藏**（隐藏时进度条/按钮/角标全消失），根因是「暂停态永不隐藏」+ 300ms 双击判定窗口；封面新增**磁盘缓存**（LRU 200MB/1000 张），滚动往返**零新下载**、**飞行模式冷启动封面仍完整显示**。详见 [HANDOVER §7.9](docs/HANDOVER.md) |
-| **一轮缺陷修复（第四轮）：一项**（控制栏显示后单击/双击全部失效） | ✅ **用户实操确认通过**（2026-10-16）：根因是全屏渐变 `Container` 自己成了命中目标（`RenderDecoratedBox.hitTestSelf` → `Decoration.hitTest` 默认 `true`），挂在手势层之上把单击/双击全吃掉；改为装饰层 `IgnorePointer` + 前景只留上下两条，并抽出可测组件 + **14 个含正反对照的命中测试**。详见 [HANDOVER §7.10](docs/HANDOVER.md) |
-| **新机兼容检查（荣耀 Magic8 Pro / Android 16 / MagicOS 10）** | ✅ **真机验证通过**（2026-10-17，App `0.2.1+4`）：冷启动登录态恢复、时间线（**20 → 40 条**分页）、系统栏无遮挡（`targetSdk 36` 强制 edge-to-edge）、通道 A 播放 + 弹幕 + 音频、评论加载更多、**保存相册（MediaStore → `Pictures/Rrha/`）**、封面磁盘缓存均正常；并修复 **Impeller 下 libmpv 只出黑屏**（manifest 关闭 Impeller，logcat 已确认生效；通道 B 的实际播放因通道 A 连续成功、构造不出回退路径而**未能复现验证**）。详见 [HANDOVER §7.11](docs/HANDOVER.md) |
-| **播放失败不再黑屏（分阶段超时 + 可读错误 + 定位日志）** | ✅ **真机验证通过**（2026-10-18）：根因是**播放器初始化没有超时**（`initialize()` 不返回 → `_loading` 永真 → 永远转圈），不是 playUrl 解析失败；新增 12s/20s/45s 三道闸 + 加载代次，把 videoInfo/playUrl/initChannelA、B/startPlayback 分阶段归类成可读 `AppError`。断网实测：**22 秒内**出现「网络不可用，请检查网络连接」+「重试」+「阶段 · bvid」；日志记 `stage=… bvid=… cid=… channel=… elapsed=… 完整URL(含 w_rid) 原始错误`；恢复网络后同视频正常播放。详见 [HANDOVER §7.12](docs/HANDOVER.md) |
-| **通道 B（libmpv）黑屏修复** | ✅ **真机验证通过**（2026-10-18，`BV1XUJe6KE31`）：真凶是**回退链把坏掉的 MP4 单流 URL 也带给了 libmpv**（该 CDN 节点 probe 实测超时）+ **mpv 没吃到 Referer**；改为通道 A 失败时**重新取 DASH 流**再交给 libmpv，并显式 `set-prop http-header-fields`；同时新增 `errorStream` 把 mpv「不抛异常也不结束」的失败转成可读错误。实测画面正常（两帧差异 0.83、亮度 139.6/255，此前纯黑）。详见 [HANDOVER §7.13](docs/HANDOVER.md) |
-| **通道 B 无声音 + 部分稿件彻底打不开的修复** | ✅ **真机验证通过**（2026-10-18，用户报的 3 个稿件逐个复测）：两个根因 —— ① B 站把 `baseUrl` **一律调度到 PCDN 节点**（`*.edge.mountaintoys.cn:4483` 手机 curl 实测 HTTP=000/12s 超时，`*.mcdn.bilivideo.cn:8082` 时通时不通），而可达的 `upos-sz-mirror*.bilivideo.com` 只在 `backupUrl` 里；② **`Media.extras: {'audio-file': …}` 在 media_kit 1.2.6 里完全无效**（`open()` 只做 `loadlist`，源码里从未消费 extras），所以 DASH 音频文件根本没被加载过，mpv 也不会报错。修法：新增 `BiliCdn` 候选排序（标准 CDN 优先、PCDN 垫底）+ 两个适配器失败自动换节点 + 音频改用 mpv 的 **`audio-add … select`** 挂外部音轨。实测 3 个稿件在**两条通道上都有画面有声音**（以 `dumpsys audio` 的 `state:started` 判声音、帧差判画面）；另新增「设置 → 强制通道 B」「设置 → 按 BV 号打开」两个可复现入口。详见 [HANDOVER §7.14](docs/HANDOVER.md) |
-| **B 站播放页补全：统计行 / 简介 / 清晰度 / 倍速 / 进度记忆** | ✅ **真机验证通过**（2026-10-21，荣耀 Magic8 Pro）：① 统计行七项（播放/弹幕/赞/币/藏/分享/评论）从 `BiliVideoInfo` 里早就解析好的字段渲染，点评论滚到评论区；② 简介可折叠，空简介不占位；③ 清晰度菜单 + 记忆（`Prefs.preferredQn`），切换后**跳回原位**；④ 倍速 0.5~2.0x（两条通道各自实现 `setSpeed`）+ 持久化；⑤ **长按 2.0x 快进**，松手回用户所选档位且弹幕时钟同步（`PlaybackClock.setSpeed`）；⑥ 全屏态共用同一套「更多」菜单；⑦ **自动续播**：进视频直接跳到上次位置（用户要求不弹窗），画面右上角给一条 2.5 秒的「已从 mm:ss 继续」角标。顺带修掉两个真机才暴露的缺陷：**playurl 缓存键漏了 qn**（切清晰度「点了没反应」）与**进度落盘在 `dispose()` 里用 `ref`**（`Bad state: Cannot use "ref" after the widget was disposed`，功能从未生效且界面看不出来）。两条通道均以 `dumpsys audio` 的 `state:started` 佐证出声（通道 A `AudioTrack` / 通道 B `OpenSL ES AudioPlayer`，appId 10312）。详见 [HANDOVER §7.23](docs/HANDOVER.md) |
-| **B 站评论配图 + 动态详情页** | ✅ **真机验证通过**（2026-11-02，荣耀 Magic8 Pro）：B 站评论的图片字段是 `content.pictures[].img_src`（**不是**微博那套 `url`/`large.url`），且服务端给的是明文 `http://`，必须归一化 —— 改前 `BiliComment.images` 恒为空，所以卡片评论区的图一张都不显示（UI 侧其实早就支持，微博评论就是走同一条渲染路径）。修法：解析层补 `images` + `imageAspectRatios`；`PhotoGrid` 支持按真实宽高比渲染，**图片展示沿用微博板块那套**：普通图按真实比例完整显示，只有真正的高 > 2×宽的长截图才在列表里只露顶部一段并标「长图 · 点击查看」，点开看完整图。动态详情页也按参考稿重排（48px 头像 / 粉色昵称 / 15px 正文 / 「评论 N　赞和转发 M」数据栏，不做 IP 属地与点赞等本 App 没有的能力）。顺带新增「按 BV 号 / 动态链接打开」：opus 链接里那段数字**不是**评论 oid（拿它查评论必然 `-404`），必须请求 detail 接口取 `basic.comment_id_str`。两个指定样本（`opus/1266051909563711506`、`BV1RXx169Emu`）均已真机确认评论图正常。详见 [HANDOVER §7.30](docs/HANDOVER.md) |
-| **移除 RSSHub 整条链路** | ✅ **真机验证通过**（2026-10-22）：用户问「rsshub 还有用吗」。结论是**早就没用了**——`Platform` 只有 `bilibili`/`weibo` 两个值，`_fetchOne()` 前两个 `if` 已把它们全部 return，第三个「拼 RSSHub 路由拉 XML」的分支**从官方接口落地那天起就一次都没执行过**。已删除：`lib/data/rss/`（客户端+解析器）、`test/rss/`、`TimelineRepository` 的 `_rss`/RSSHub 分支/`baseUrl` 参数、`rssHubClientProvider`/`rssDioProvider`/`createRssDio`、`Prefs` 与 `AppConfig` 里的实例配置、设置页**整个「RSSHub 实例」卡片**。顺手修掉 4 处「删了才暴露」的误导文案（`rateLimited` 还在教用户「更换实例」、关于页还写着「公共 RSSHub 原型验证版」、订阅源页还说微博「只能内置浏览器打开」）＋「RSS 缓存」改名「接口缓存」。真机：设置页首屏直接是数据源状态、时间线 **117 条 · 6 个订阅源** 正常。`dart analyze` 干净、**989 测试全过**。详见 [HANDOVER §7.26](docs/HANDOVER.md) |
+| 验证项 | 结果 |
+| --- | --- |
+| `flutter pub get` | ✅ 依赖解析成功（Flutter 3.47.7 / Dart 3.13.5） |
+| `dart analyze` | ✅ **No issues found** |
+| `flutter test` | ✅ **全部通过**（千级用例，含登录、时间线、播放、弹幕、评论、图片） |
+| 线上接口 | ✅ 已逐条实测，并按真实返回形态修正过代码 |
+| 真机验收 | ✅ 两台机型（华为 P40 Pro / 荣耀 Magic8 Pro）均通过，见 [ACCEPTANCE.md](docs/ACCEPTANCE.md) |
+
+> 详细的逐轮修复记录（每一轮的根因、修法、验证数据）保存在 git 历史与本文件的
+> [开发档案](#-以下为项目内部开发档案) 区，按主题汇总的「踩坑结论表」见
+> [docs/HANDOVER.md §7](docs/HANDOVER.md)。
 
 真机关键结果：冷启动 **682 ms**、弹幕 **83.6 fps**（最坏情况 62.7 fps）、  
 B 站播放与弹幕渲染与评论均通过。
 
-> 注：上方「公共 RSSHub 实例不可用」是 2026-10 的历史验收结论。  
-> 该链路已于 2026-10-22 整体移除（见上一行），项目现为纯官方接口架构。
+> 注：「公共 RSSHub 实例不可用」是 2026-10 的历史验收结论。
+> 该链路已于 2026-10-22 整体移除，项目现为纯官方接口架构（见 [HANDOVER §7.6](docs/HANDOVER.md)）。
 
 > 编写环境有个特殊点：`flutter analyze` 走 LSP 通道，在受限沙箱里会崩，  
 > 因此静态检查是用等价的 `dart analyze` 完成的。**在正常开发机上 `flutter analyze` 应照常可用。**
