@@ -18,6 +18,7 @@ import 'data/models/danmaku_item.dart';
 import 'data/models/subscription.dart';
 import 'data/models/timeline_mode.dart';
 import 'data/repo/comment_repo.dart';
+import 'data/repo/source_cursor.dart';
 import 'data/repo/subscription_repo.dart';
 import 'data/repo/timeline_floor.dart';
 import 'data/repo/timeline_repo.dart';
@@ -357,6 +358,7 @@ class TimelineState {
     this.biliEnded = false,
     this.weiboEnded = false,
     this.followingPool,
+    this.selectedCursors = const <String, SourceCursor>{},
   });
 
   final bool loading;
@@ -433,19 +435,31 @@ class TimelineState {
   /// 全量池（不细分时回落到 [items]），供 loadMore 做增量合并。
   List<ContentItem> get allLoaded => followingPool ?? items;
 
+  /// 「精选订阅」每个源的翻页游标（键 `{subscriptionId}#{routeKey}`）。
+  ///
+  /// 空 Map 表示「没有可继续翻的源」（首屏尚未加载，或全部到底）。
+  /// 与 [followingOffset]/[followingMaxId] **是两套完全不同的东西**：
+  /// 那两个属于「全部关注」的整页游标，这里每个订阅源各一个。
+  final Map<String, SourceCursor> selectedCursors;
+
   bool get isEmpty => items.isEmpty;
 
   int get newCount => items.where((i) => i.isNew).length;
 
   /// 是否还能继续往下翻（供 UI 显示加载态 / 到底提示）。
   ///
-  /// 判据是「**任一侧**还有游标」：微博到底而 B 站还有时必须继续能翻，
-  /// 不能因为微博侧没游标就把整页停住。
-  bool get canLoadMore =>
-      mode.isPaged &&
-      followingHasMore &&
-      ((followingOffset?.isNotEmpty ?? false) ||
-          (followingMaxId?.isNotEmpty ?? false));
+  /// 判据按模式分流：
+  /// - 「全部关注」：**任一侧**还有游标（微博到底而 B 站还有时必须继续能翻）；
+  /// - 「精选订阅」：还有任何一个源没到底。
+  bool get canLoadMore {
+    if (mode == TimelineMode.selectedSubscriptions) {
+      return selectedCursors.isNotEmpty;
+    }
+    return mode.isPaged &&
+        followingHasMore &&
+        ((followingOffset?.isNotEmpty ?? false) ||
+            (followingMaxId?.isNotEmpty ?? false));
+  }
 
   /// 有错误但仍展示了内容：属于「部分降级」，UI 用横幅提示而不是整页错误。
   bool get partialFailure =>
@@ -480,6 +494,8 @@ class TimelineState {
     bool? biliEnded,
     bool? weiboEnded,
     List<ContentItem>? followingPool,
+    Map<String, SourceCursor>? selectedCursors,
+    bool clearSelectedCursors = false,
   }) =>
       TimelineState(
         loading: loading ?? this.loading,
@@ -508,6 +524,9 @@ class TimelineState {
         biliEnded: biliEnded ?? this.biliEnded,
         weiboEnded: weiboEnded ?? this.weiboEnded,
         followingPool: followingPool ?? this.followingPool,
+        selectedCursors: clearSelectedCursors
+            ? const <String, SourceCursor>{}
+            : (selectedCursors ?? this.selectedCursors),
       );
 }
 
@@ -667,6 +686,10 @@ class TimelineNotifier extends StateNotifier<TimelineState> {
   ///
   /// 这样滚到底看到的永远是「B 站 + 微博」交错，而不是先微博一大片再补 B 站。
   Future<void> loadMore() async {
+    // 「精选订阅」走另一条路径（每个源各自的游标），见 [loadMoreSelected]。
+    if (state.mode == TimelineMode.selectedSubscriptions) {
+      return loadMoreSelected();
+    }
     if (!state.mode.isPaged) return;
     if (state.loadingMore || state.loading || !state.canLoadMore) return;
 
@@ -863,7 +886,9 @@ class TimelineNotifier extends StateNotifier<TimelineState> {
 
     final repo = _ref.read(timelineRepoProvider);
     try {
-      final result = await repo.load(
+      // 首屏/刷新统一用 loadPage：它会带回每个源的下一页游标，
+      // 滚到底时 `loadMoreSelected` 直接接着翻。
+      final page = await repo.loadPage(
         subscriptions: subs,
         forceRefresh: force,
       );
@@ -888,16 +913,36 @@ class TimelineNotifier extends StateNotifier<TimelineState> {
       state = TimelineState(
         initialized: true,
         mode: TimelineMode.selectedSubscriptions,
-        items: result.items,
-        statuses: result.statuses,
+        items: page.items,
+        statuses: page.statuses,
         subscriptions: effectiveSubs,
-        error: result.fatalError,
-        emptyHint: result.emptyHint,
-        lastUpdated: result.lastUpdated,
-        staleFallbackUsed: result.staleFallbackUsed,
+        error: page.fatalError,
+        emptyHint: page.emptyHint,
+        lastUpdated: page.lastUpdated,
+        staleFallbackUsed: page.staleFallbackUsed,
+        selectedCursors: page.nextCursors,
       );
       // 写快照：切回本模式时靠它做到「秒回」（见 [setMode]）。
       _rememberSnapshot();
+
+      // ---------------------------------------------------------------
+      // 首屏之后**自动预取更早的内容**（2026-11-08 修「warma 只看得到 10 天」）。
+      //
+      // 为什么需要：微博一页只给 10~11 条，而慢更博主的 10 条可能只覆盖十几天。
+      // 原先必须等用户把整条时间线**滚到最底部**才会触发 `loadMoreSelected`，
+      // 可列表里 B 站内容密度约为微博的 25 倍 —— 用户滚到「十天前」时，
+      // 微博的第二页根本还没被请求，看起来就是「十天前的微博全都没有」。
+      //
+      // 做法：首屏落地后**继续往后翻若干轮**，把每个源都拉到足够深。
+      // 不加对话框、不打扰用户，只是把「滚到底才发生的事」提前到加载阶段。
+      //
+      // 上限 [_kPrefetchRounds] 轮：精选订阅有 N 个源、每轮 N 个请求，
+      // 预取过多会成倍放大请求量（本项目曾被平台风控冷却过）。
+      // 3 轮 = 每源最多多拿 3 页 ≈ 30 条，足以把慢更博主推进到一个月以上。
+      //
+      // ⚠️ 只在**刷新**时预取，`loadMoreSelected` 内部不会再调它（见那里的守卫），
+      // 避免无限递归。
+      await _prefetchOlderRounds(force: force);
     } catch (e) {
       state = TimelineState(
         initialized: true,
@@ -909,6 +954,234 @@ class TimelineNotifier extends StateNotifier<TimelineState> {
             ? e
             : AppError(AppErrorKind.unknown, '刷新失败：$e'),
         lastUpdated: state.lastUpdated,
+        selectedCursors: state.selectedCursors,
+      );
+    }
+  }
+
+  /// 首屏之后自动补拉更早内容的轮数上限（见 `_prefetchOlderRounds`）。
+  ///
+  /// 3 轮 ≈ 每个源多拿 3 页。微博一页 10~11 条，30 条足以把慢更博主
+  /// （warma 那种十几天发一条的）推进到一两个月以前。
+  /// 再大就会明显放大请求量，而本项目已经被平台风控冷却过。
+  static const int _kPrefetchRounds = 3;
+
+  /// 预取的目标深度：**每个源各自被拉到这个时间点**才算够。
+  ///
+  /// 为什么不用「固定翻 N 轮」：各源密度差 25 倍以上。B 站一页 20 条只跨几小时，
+  /// 微博一页 10 条却跨十几天。同样翻 3 轮，B 站被拉到几年前、
+  /// 微博才刚过十天 —— 列表里于是出现「大量 B 站内容 + 极稀疏的微博」，
+  /// 用户滚半天也看不到想看的微博。
+  ///
+  /// 改成按**时间深度**判定：够深就停，不够才继续。这样两边的推进速度
+  /// 由各自的内容密度自然决定，最终能在同一个时间范围相遇。
+  static const Duration _kPrefetchDepth = Duration(days: 45);
+
+  /// 「精选订阅」首屏之后，**自动**把每个源再往后翻几轮。
+  ///
+  /// ## 为什么需要它（这是「warma 只看得到 10 天」的真正修法）
+  ///
+  /// 微博 `getIndex` 一页只返回 10~11 条。慢更博主的这 10 条可能只覆盖
+  /// 十来天 —— 于是**首屏天然就只有最近十天**。
+  ///
+  /// 光有翻页还不够：`loadMoreSelected` 只在「列表滚到最底部」时才被调用，
+  /// 而「精选订阅」列表里 B 站内容的密度约为微博的 **25 倍**
+  /// （B 站 feed/all 约 40 条/天，微博 feed/friends 约 1.7 条/天）。
+  /// 用户滚到「十天前」那个位置时，列表总长度早就超过按下限截断的量，
+  /// 微博第二页压根没被请求过。
+  ///
+  /// 所以在加载阶段就主动补几轮，把「更早的内容」变成**已经在列表里**，
+  /// 而不是「等用户滚到底才有」。
+  ///
+  /// ## 纪律
+  ///
+  /// - **不阻塞首屏**：首屏 `state` 已经赋值并 `_rememberSnapshot` 过了，
+  ///   这里只是在后台把内容追加进来；
+  /// - **失败不报错**：补拉失败只是「没有更早内容」，不该把已有内容标成错误；
+  /// - **到底就停**：某个源没有下一页游标了，自然不再请求它；
+  /// - **只在刷新时跑**：`loadMoreSelected` 不会回调本方法，不会递归。
+  /// 预取是否正在跑（防重入）。
+  ///
+  /// 为什么必须有：`refresh()` 的触发源有好几个 —— 冷启动、登录态就绪回调、
+  /// 用户下拉、切模式。真机日志里能看到同一秒内「预取第 2 轮」出现 3 次、
+  /// 「第 3 轮」出现 3 次：每一次 `_refreshSubscriptions` 都会新起一条
+  /// 预取链，几条链同时往后翻，**请求量翻倍**（本项目被平台冷却过，不能这么干）。
+  ///
+  /// 有了这个标志，同一时刻只允许一条预取链在跑。
+  bool _prefetching = false;
+
+  Future<void> _prefetchOlderRounds({required bool force}) async {
+    if (_prefetching) {
+      Log.d('Timeline', '预取已在运行，跳过本次');
+      return;
+    }
+    _prefetching = true;
+    try {
+      await _prefetchLoop();
+    } finally {
+      _prefetching = false;
+    }
+  }
+
+  Future<void> _prefetchLoop() async {
+    Log.d('Timeline', '预取开始：目标深度 ${_kPrefetchDepth.inDays} 天，'
+        '最多 $_kPrefetchRounds 轮');
+    for (int round = 0; round < _kPrefetchRounds; round++) {
+      if (state.mode != TimelineMode.selectedSubscriptions) return;
+
+      // 只翻**还没拉够深**的源。
+      //
+      // 这是本方法的第二个关键设计（第一个是按时间判深度）：每轮都只请求
+      // 「水位还没到目标」的那些源。B 站内容密度是微博的 25 倍，如果每轮
+      // 无差别全翻，B 站会一路被拉到几年前，而微博才刚过十天 ——
+      // 列表里于是是「大量 B 站 + 极稀疏微博」，滚半天看不到想看的。
+      final Set<String> shallow = _sourcesShallowerThan(_kPrefetchDepth);
+      if (shallow.isEmpty) {
+        Log.d('Timeline', '预取结束：所有源都已达到目标深度');
+        return;
+      }
+
+      final cursors = <String, SourceCursor>{
+        for (final MapEntry<String, SourceCursor> e
+            in state.selectedCursors.entries)
+          if (shallow.contains(e.key.split('#').first)) e.key: e.value,
+      };
+      if (cursors.isEmpty) {
+        Log.d('Timeline', '预取结束：需要补的源都已到底');
+        return;
+      }
+
+      final subs = _prefs.subscriptions;
+      if (subs.isEmpty) return;
+
+      try {
+        final page = await _ref.read(timelineRepoProvider).loadPage(
+              subscriptions: subs,
+              // ⚠️ 预取**必须跳过缓存**。
+              //
+              // 翻页用的是**新的游标**，理论上不会命中首屏那页的缓存；
+              // 但同一轮里反复「刷新 + 预取」时会拿到 5 分钟 TTL 内的旧页 ——
+              // 表现为「预取跑完了，列表却没变长」。
+              // 各源的下一页本来就没缓存过，强制刷新不会浪费请求。
+              forceRefresh: true,
+              cursors: cursors,
+            );
+        final merged =
+            TimelineRepository.mergeContinuing(state.items, page.items);
+
+        // 游标要**合并**而不是替换：本轮只翻了部分源，没翻的那些
+        // 必须保留原游标，否则它们会被误判成「已到底」而永久停止翻页。
+        final mergedCursors = <String, SourceCursor>{...state.selectedCursors}
+          ..removeWhere((String k, _) => cursors.containsKey(k))
+          ..addAll(page.nextCursors);
+
+        state = state.copyWith(
+          items: merged,
+          selectedCursors: mergedCursors,
+        );
+        _rememberSnapshot();
+        Log.d(
+          'Timeline',
+          '预取第 ${round + 1} 轮：请求 ${cursors.length} 个源，'
+              '拉回 ${page.items.length} 条 | '
+              '累计 ${merged.length} 条 | '
+              '剩余可翻源 ${mergedCursors.length} 个',
+        );
+        // 本轮一条新内容都没有 → 再翻也是白翻，直接停。
+        if (page.items.isEmpty) return;
+      } catch (e) {
+        // 补拉失败不改变已有内容，也不弹错误：用户手里的列表是好的。
+        Log.w('Timeline', '预取第 ${round + 1} 轮失败（忽略）：$e');
+        return;
+      }
+    }
+  }
+
+  /// 找出**拉得还不够深**的源。
+  ///
+  /// ## 为什么不能只看「最旧一条的时间」
+  ///
+  /// 试过那个写法，立刻踩坑：微博博主通常有一条**多年前的置顶微博**。
+  /// 例如 warma 的第 1 页里就有 `2023-08-07` 的置顶，于是该源「最旧条目」
+  /// 看上去是 3 年前 —— 被判定成「已经拉得很深」，预取一轮都不跑。
+  /// 真机日志就是这样：`预取结束：所有源都已达到目标深度`。
+  ///
+  /// ## 改用「已加载条目数的中位时间」
+  ///
+  /// 把该源的条目按时间倒序排，取**中间那一条**的时间当作覆盖深度的估计：
+  /// 单条异常值（置顶、手滑发的旧转发）不会再把整段判断带偏。
+  ///
+  /// 仍然用 `now - depth` 作阈值：中位时间比它更晚 → 这个源大部分内容
+  /// 还挤在最近几天/十几天里 → 需要继续往后翻。
+  Set<String> _sourcesShallowerThan(Duration depth) {
+    final DateTime cutoff = DateTime.now().toUtc().subtract(depth);
+    final Map<String, List<DateTime>> bySource = <String, List<DateTime>>{};
+    for (final ContentItem item in state.items) {
+      bySource.putIfAbsent(item.sourceId, () => <DateTime>[]).add(item.sortKey);
+    }
+
+    final Set<String> shallow = <String>{};
+    for (final MapEntry<String, List<DateTime>> e in bySource.entries) {
+      final List<DateTime> times = e.value
+        ..sort((DateTime a, DateTime b) => b.compareTo(a)); // 新 → 旧
+      // 条目太少（< 6）：样本不够，中位数没有意义。
+      // 这种情况下**当作需要补**（宁可多翻一轮，也不要停在「只有 3 条」）。
+      if (times.length < 6) {
+        shallow.add(e.key);
+        continue;
+      }
+      final DateTime median = times[times.length ~/ 2];
+      if (median.isAfter(cutoff)) shallow.add(e.key);
+    }
+    return shallow;
+  }
+
+  /// 「精选订阅」翻下一页：把每个源更早的内容追加进来。
+  ///
+  /// 与「全部关注」的 `loadMore` 是**两条独立路径**：
+  /// 那边是两个整页游标，这里是每个源各自的游标（见 [SourceCursor]）。
+  ///
+  /// 合并走 `mergeContinuing`（去重 + 稳定倒序），与「全部关注」同一套规则 ——
+  /// 直接 append 会让新拿到的更早内容接在末尾，时间线立刻乱序。
+  Future<void> loadMoreSelected() async {
+    if (state.loadingMore || state.loading || state.refreshing) return;
+    final cursors = state.selectedCursors;
+    if (cursors.isEmpty) return; // 所有源都到底了
+
+    final subs = _prefs.subscriptions;
+    if (subs.isEmpty) return;
+
+    state = state.copyWith(loadingMore: true, clearError: true);
+    try {
+      final page = await _ref.read(timelineRepoProvider).loadPage(
+            subscriptions: subs,
+            // 翻页**必须**跳过缓存：同一个 key 在 5 分钟 TTL 内会直接命中，
+            // 拿回的还是同一页，表现为「滚到底没反应」。缓存键里已带游标，
+            // 但强制刷新更稳妥（各源的下一页本来就没缓存过）。
+            forceRefresh: false,
+            cursors: cursors,
+          );
+
+      // 只保留「仍然可见」的这批的增量；全量按时间去重合并。
+      final merged = TimelineRepository.mergeContinuing(state.items, page.items);
+      state = state.copyWith(
+        items: merged,
+        loadingMore: false,
+        selectedCursors: page.nextCursors,
+      );
+      Log.d(
+        'Timeline',
+        'loadMoreSelected 拉回 ${page.items.length} 条 | '
+        '去重后累计 ${merged.length} 条 | '
+        '剩余可翻源 ${page.nextCursors.length} 个',
+      );
+      _rememberSnapshot();
+    } catch (e) {
+      state = state.copyWith(
+        loadingMore: false,
+        error: e is AppError
+            ? e
+            : AppError(AppErrorKind.unknown, '加载更多失败：$e'),
       );
     }
   }

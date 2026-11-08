@@ -1,4 +1,4 @@
-﻿import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:rrha/core/storage/prefs.dart';
 import 'package:rrha/data/bili/bili_timeline_source.dart';
@@ -6,6 +6,7 @@ import 'package:rrha/data/models/content_item.dart';
 import 'package:rrha/data/models/subscription.dart';
 import 'package:rrha/data/models/timeline_mode.dart';
 import 'package:rrha/data/repo/timeline_repo.dart';
+import 'package:rrha/data/repo/source_cursor.dart';
 import 'package:rrha/providers.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -132,6 +133,31 @@ class _FakeTimelineRepo extends TimelineRepository {
         ),
       },
       lastUpdated: DateTime.utc(2026, 10, 15),
+    );
+  }
+
+  /// 「精选订阅」首屏/刷新现在走 `loadPage`（它带回每个源的下一页游标）。
+  /// 这里把 [load] 的结果原样包一层，`nextCursors` 给空表示「没有更多」——
+  /// 本文件的用例只关心首屏行为，不涉及精选订阅翻页。
+  @override
+  Future<SelectedPage> loadPage({
+    required List<Subscription> subscriptions,
+    bool forceRefresh = false,
+    Map<String, SourceCursor> cursors = const <String, SourceCursor>{},
+  }) async {
+    final r = await load(
+      subscriptions: subscriptions,
+      forceRefresh: forceRefresh,
+    );
+    return SelectedPage(
+      items: r.items,
+      statuses: r.statuses,
+      nextCursors: const <String, SourceCursor>{},
+      hasMore: false,
+      lastUpdated: r.lastUpdated,
+      staleFallbackUsed: r.staleFallbackUsed,
+      fatalError: r.fatalError,
+      emptyHint: r.emptyHint,
     );
   }
 }

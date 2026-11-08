@@ -8,6 +8,7 @@ import '../models/content_item.dart';
 import '../models/subscription.dart';
 import '../weibo/weibo_backend.dart';
 import '../weibo/weibo_timeline_source.dart';
+import 'source_cursor.dart';
 
 /// 一次时间线刷新的结果。
 class TimelineResult {
@@ -156,10 +157,17 @@ class _FetchTask {
   const _FetchTask({
     required this.subscription,
     required this.route,
+    this.cursor = SourceCursor.first,
   });
 
   final Subscription subscription;
   final FeedRoute route;
+
+  /// 该源本次要拉的翻页位置（见 [SourceCursor]）。
+  final SourceCursor cursor;
+
+  /// 与 `TimelineResult.statuses` 一致的键。
+  String get key => '${subscription.id}#${route.key}';
 }
 
 class _FetchOutcome {
@@ -169,6 +177,7 @@ class _FetchOutcome {
     required this.status,
     this.error,
     this.emptyHint,
+    this.nextCursor,
   });
 
   final _FetchTask task;
@@ -176,6 +185,9 @@ class _FetchOutcome {
   final SourceStatus status;
   final AppError? error;
   final String? emptyHint;
+
+  /// 该源下一页的游标；null = 这个源已经到底（不再参与后续翻页）。
+  final SourceCursor? nextCursor;
 }
 
 /// 时间线聚合仓库。
@@ -508,33 +520,94 @@ class TimelineRepository {
     }
   }
 
+  /// 拉取「精选订阅」的一屏内容。
+  ///
+  /// [cursors] 是**每个源**的翻页位置（键 `{subscriptionId}#{routeKey}`）。
+  /// 不传 = 全部从第一页开始（首屏 / 下拉刷新）。
+  ///
+  /// 返回值里的 [SelectedPage.nextCursors] 是该批源的下一页游标，
+  /// provider 拿着它就能在滚到底时继续往后翻。
+  Future<SelectedPage> loadPage({
+    required List<Subscription> subscriptions,
+    bool forceRefresh = false,
+    Map<String, SourceCursor> cursors = const <String, SourceCursor>{},
+  }) async {
+    final result = await _loadInternal(
+      subscriptions: subscriptions,
+      forceRefresh: forceRefresh,
+      cursors: cursors,
+      // 翻页时**不要**再按「最多 200 条」整体截断：那是首屏的保护，
+      // 翻页本来就是在追加更早的内容，截断会让用户永远到不了更早的条目。
+      applyLimit: cursors.isEmpty,
+    );
+    return SelectedPage(
+      items: result.items,
+      statuses: result.statuses,
+      nextCursors: result.nextCursors,
+      hasMore: result.nextCursors.isNotEmpty,
+      lastUpdated: result.lastUpdated,
+      staleFallbackUsed: result.staleFallbackUsed,
+      fatalError: result.fatalError,
+      emptyHint: result.emptyHint,
+    );
+  }
+
   Future<TimelineResult> load({
     required List<Subscription> subscriptions,
     bool forceRefresh = false,
   }) async {
+    return _loadInternal(
+      subscriptions: subscriptions,
+      forceRefresh: forceRefresh,
+      cursors: const <String, SourceCursor>{},
+      applyLimit: true,
+    );
+  }
+
+  Future<_LoadResult> _loadInternal({
+    required List<Subscription> subscriptions,
+    required bool forceRefresh,
+    required Map<String, SourceCursor> cursors,
+    required bool applyLimit,
+  }) async {
     final tasks = <_FetchTask>[];
     for (final sub in subscriptions) {
       for (final route in sub.activeRoutes) {
-        tasks.add(_FetchTask(subscription: sub, route: route));
+        final key = '${sub.id}#${route.key}';
+        tasks.add(
+          _FetchTask(
+            subscription: sub,
+            route: route,
+            cursor: cursors[key] ?? SourceCursor.first,
+          ),
+        );
       }
     }
 
-    if (tasks.isEmpty) {
-      return const TimelineResult(
+    // 翻页时**只请求还有下一页的源**：到底的源不再发请求。
+    // 首屏（cursors 为空）不经过这层过滤。
+    final activeTasks = cursors.isEmpty
+        ? tasks
+        : tasks.where((t) => cursors.containsKey(t.key)).toList();
+
+    if (activeTasks.isEmpty) {
+      return const _LoadResult(
         items: <ContentItem>[],
         statuses: <String, SourceStatus>{},
+        nextCursors: <String, SourceCursor>{},
         emptyHint: '还没有订阅源。去「订阅」页添加 B 站 UID 或微博 UID。',
       );
     }
 
     final outcomes = await mapLimit<_FetchTask, _FetchOutcome>(
-      tasks,
+      activeTasks,
       AppConfig.maxConcurrentFetches,
       (t) => _fetchOne(t, forceRefresh: forceRefresh),
     );
 
     final merged = <String, ContentItem>{};
     final statuses = <String, SourceStatus>{};
+    final nextCursors = <String, SourceCursor>{};
     var staleUsed = false;
     DateTime? lastUpdated;
     String? hint;
@@ -545,6 +618,12 @@ class TimelineRepository {
         merged.putIfAbsent(item.id, () => item);
       }
       statuses['${o.task.subscription.id}#${o.task.route.key}'] = o.status;
+      // 只有**成功且还有下一页**的源才进入下一轮翻页。
+      // 失败时不给游标：否则会在错误的游标上反复重试同一个坏页。
+      final next = o.nextCursor;
+      if (next != null && o.error == null) {
+        nextCursors[o.task.key] = next;
+      }
       if (o.status.fromCache) staleUsed = true;
       if (o.status.lastSuccessAt != null) {
         final prev = lastUpdated;
@@ -559,7 +638,7 @@ class TimelineRepository {
     // 排序 + 截断
     final sorted = merged.values.toList()
       ..sort((a, b) => b.sortKey.compareTo(a.sortKey));
-    final limited = sorted.length > AppConfig.timelineMaxItems
+    final limited = applyLimit && sorted.length > AppConfig.timelineMaxItems
         ? sorted.sublist(0, AppConfig.timelineMaxItems)
         : sorted;
 
@@ -577,9 +656,10 @@ class TimelineRepository {
       fatal = errors.first;
     }
 
-    return TimelineResult(
+    return _LoadResult(
       items: marked,
       statuses: statuses,
+      nextCursors: nextCursors,
       lastUpdated: lastUpdated,
       staleFallbackUsed: staleUsed,
       fatalError: fatal,
@@ -655,7 +735,12 @@ class TimelineRepository {
         sub: task.subscription,
         route: task.route,
         forceRefresh: forceRefresh,
+        page: task.cursor.page,
+        offset: task.cursor.offset,
       );
+      // 下一页游标：投稿看 nextPage，动态看 nextOffset。
+      // 两者都为 null 说明这个源到底了，后续翻页不再请求它。
+      final SourceCursor? next = _nextCursor(task.cursor, res);
       return _FetchOutcome(
         task: task,
         items: res.items,
@@ -668,6 +753,7 @@ class TimelineRepository {
           itemCount: res.items.length,
         ),
         emptyHint: res.emptyHint,
+        nextCursor: next,
       );
     } on AppError catch (e) {
       return _FetchOutcome(
@@ -681,6 +767,25 @@ class TimelineRepository {
         error: e,
       );
     }
+  }
+
+  /// 由本次拉取结果推出该源的**下一页**游标。
+  ///
+  /// - 投稿路由：`nextPage` 非空 → 页码 +1（服务端不直接给页码）；
+  /// - 动态路由：`nextOffset` 非空 → 用服务端给的 offset；
+  /// - 都没有 → null（到底）。
+  ///
+  /// ⚠️ 这里**不能**用「本页条数 < 每页上限」来判定到底：
+  /// B 站动态接口会过滤掉部分条目（审核中/仅粉丝可见），一页 10 条
+  /// 也可能还有下一页。只认服务端明确给的 offset。
+  static SourceCursor? _nextCursor(SourceCursor cur, BiliFetchResult res) {
+    if (res.nextOffset != null) {
+      return cur.copyWith(offset: res.nextOffset);
+    }
+    if (res.nextPage != null) {
+      return cur.copyWith(page: res.nextPage);
+    }
+    return null;
   }
 
   /// 微博订阅源：走官方接口（`m.weibo.cn/api/container/getIndex`）。
@@ -718,10 +823,26 @@ class TimelineRepository {
         sub: task.subscription,
         route: task.route,
         forceRefresh: forceRefresh,
+        // 翻页游标：首屏为 null。**这一行曾经缺失**，导致微博源永远只拉
+        // 第一页 —— 用户看到的「warma 的动态只有近 10 天」就是这个原因
+        // （一页 20 条，慢更博主 20 条能横跨十几天）。
+        sinceId: task.cursor.sinceId,
       );
       // 昵称回填：拉取结果里自带博主 `screen_name`（见 `WeiboParser`），
       // **零额外请求**。失败绝不影响内容展示 —— `_backfillWeiboAlias` 自己吞异常。
       await _backfillWeiboAlias(task.subscription, res.authorName);
+
+      // 下一页游标。三条纪律，缺一条都会让翻页链断掉或空转：
+      //
+      // 1. **空串一律当没有**：服务端在到底时会回 `since_id: ""`，
+      //    把它当合法游标会在同一位置无限重试（表现为「滚到底一直转圈」）；
+      // 2. **本页 0 条 → 不给游标**：0 条意味着这个方向已经没有内容了，
+      //    再拿同一份游标去问只会拿回同样的 0 条。这是防止
+      //    `getIndex` 的 `since_id` 方向万一与预期相反时的**保险丝** ——
+      //    即使方向反了，也只会翻一页就停，不会把整条时间线拖进死循环；
+      // 3. 游标原样透传（19 位大整数过数值类型会丢精度）。
+      final String nextId = (res.nextSinceId ?? '').trim();
+      final bool canPage = nextId.isNotEmpty && res.items.isNotEmpty;
       return _FetchOutcome(
         task: task,
         items: res.items,
@@ -734,6 +855,8 @@ class TimelineRepository {
           itemCount: res.items.length,
         ),
         emptyHint: res.emptyHint,
+        nextCursor:
+            canPage ? task.cursor.copyWith(sinceId: nextId) : null,
       );
     } on AppError catch (e) {
       return _FetchOutcome(
@@ -801,4 +924,20 @@ class TimelineRepository {
     if (diff.inHours < 24) return '${diff.inHours} 小时前';
     return '${diff.inDays} 天前';
   }
+}
+
+/// [_loadInternal] 的内部结果：比 [TimelineResult] 多带一份「下一页游标」。
+class _LoadResult extends TimelineResult {
+  const _LoadResult({
+    required super.items,
+    required super.statuses,
+    required this.nextCursors,
+    super.lastUpdated,
+    super.staleFallbackUsed,
+    super.fatalError,
+    super.emptyHint,
+  });
+
+  /// 每个源下一页的游标；空 Map = 所有源都到底了。
+  final Map<String, SourceCursor> nextCursors;
 }

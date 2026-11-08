@@ -392,10 +392,66 @@ class BiliClient {
     return vlist is List ? vlist : const <Object?>[];
   }
 
+  /// 某个 UP 主的头像 URL（`face`），拿不到时返回 null。
+  ///
+  /// ## 为什么需要这个接口（2026-11-08，用户报「精选订阅里 B 站博主头像不显示」）
+  ///
+  /// 投稿列表接口（`/x/space/wbi/arc/search`）的 `vlist[]` 里**没有 `face` 字段**，
+  /// 只有 `author`（昵称）和 `mid`。真机缓存已核实：
+  ///
+  /// ```json
+  /// {"author":"w咸瑜","mid":91647207,"bvid":"BV1hB4E6VEdF", ...}
+  /// ```
+  ///
+  /// 所以走投稿路由的卡片`authorAvatar` 恒为 null → 卡片只能显示「首字母圆形
+  /// 占位」。动态路由（`feed/space`）的 `module_author.face` 是有的，这就是
+  /// 「动态卡片有头像、投稿卡片没有」这一现象的全部原因。
+  ///
+  /// ## 纪律
+  ///
+  /// - **不签名**（`wbi: false`）：实测该接口走 `acc/info` + WBI 会命中风控
+  ///   `-352`，而裸 `card` 接口 `?mid=` 直接给 `face`；
+  /// - **失败一律返回 null**，绝不让「拿不到头像」影响内容展示；
+  /// - 调用方负责缓存（同一 UP 只请求一次），这里不做缓存。
+  Future<String?> userAvatar({required int mid}) async {
+    try {
+      final json = await _get(
+        '/x/web-interface/card',
+        params: <String, dynamic>{'mid': mid},
+        wbi: false,
+      );
+      final data = json['data'];
+      if (data is! Map) return null;
+      final card = Map<String, dynamic>.from(data)['card'];
+      if (card is! Map) return null;
+      final face = Map<String, dynamic>.from(card)['face']?.toString();
+      return (face == null || face.isEmpty) ? null : face;
+    } catch (e) {
+      // 头像只是装饰：任何失败都降级为「没有头像」，不抛、不重试。
+      Log.w('BiliClient', '取 UP 主头像失败（mid=$mid，忽略）：$e');
+      return null;
+    }
+  }
+
   /// 某个 UP 主的动态，返回**原始** `items`。
   ///
   /// 需要 WBI 签名 + 登录态。
+  ///
+  /// 需要下一页游标时用 [userDynamicPage] —— 这个旧入口保持「只给 items」
+  /// 的形状，避免动到既有调用点。
   Future<List<Object?>> userDynamicItems({
+    required int mid,
+    String? offset,
+  }) async {
+    final page = await userDynamicPage(mid: mid, offset: offset);
+    return page.items;
+  }
+
+  /// 某个 UP 主的动态 + **下一页 offset**。
+  ///
+  /// 实测响应里的翻页游标在 `data.offset`（字符串，19 位数字）；
+  /// 到底时该字段为空串或缺失 —— 那时 `nextOffset` 为 null。
+  Future<BiliDynamicPage> userDynamicPage({
     required int mid,
     String? offset,
   }) async {
@@ -413,9 +469,19 @@ class BiliClient {
       params: params,
     );
     final data = json['data'];
-    if (data is! Map) return const <Object?>[];
-    final items = Map<String, dynamic>.from(data)['items'];
-    return items is List ? items : const <Object?>[];
+    if (data is! Map) {
+      return const BiliDynamicPage(items: <Object?>[], nextOffset: null);
+    }
+    final map = Map<String, dynamic>.from(data);
+    final items = map['items'];
+    final rawOffset = map['offset'];
+    final nextOffset = rawOffset is String && rawOffset.trim().isNotEmpty
+        ? rawOffset.trim()
+        : null;
+    return BiliDynamicPage(
+      items: items is List ? items : const <Object?>[],
+      nextOffset: nextOffset,
+    );
   }
 
   /// 单条动态详情（`/x/polymer/web-dynamic/v1/detail`），返回**原始 item**。
@@ -709,4 +775,19 @@ class BiliClient {
     }
     return Uint8List.fromList(res.data ?? const <int>[]);
   }
+}
+
+/// 动态列表的一页：原始 items + 下一页 offset。
+///
+/// 单独建类而不是给 [BiliClient.userDynamicItems] 加出参：那个方法被
+/// 「精选订阅」以外的调用点用着，改签名会牵连无关代码。
+class BiliDynamicPage {
+  const BiliDynamicPage({required this.items, required this.nextOffset});
+
+  final List<Object?> items;
+
+  /// 下一页游标；null 表示到底了（服务端 `data.offset` 为空）。
+  final String? nextOffset;
+
+  bool get hasMore => nextOffset != null;
 }

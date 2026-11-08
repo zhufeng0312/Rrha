@@ -30,7 +30,12 @@ Future<void> main() async {
   // 忘了注入的话缓存目录会被建出来、索引也写了，但里面永远是空的 ——
   // 现象是「图片每次都联网、磁盘命中率恒为 0」，极难从界面反推
   // （真机上就是这样撞见的：`image_cache/` 建好了，`index.json` 只有 26 字节）。
-  final imageCache = ImageCacheStore(dio: DioFactory.createBiliDio());
+  //
+  // ⚠️ **必须用 [DioFactory.createImageDio]，不能复用 createBiliDio**：
+  // 后者带着 B 站 `Referer`/`Origin`/`Accept: application/json`，
+  // 微博图床收到 B 站 Referer 会直接 403（2026-11-08 实测），
+  // 导致**所有微博图片（头像/封面）都下不下来**。
+  final imageCache = ImageCacheStore(dio: DioFactory.createImageDio());
   await imageCache.ensureReady();
 
   runApp(

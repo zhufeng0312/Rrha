@@ -4,6 +4,7 @@ import '../../core/cache/cache_store.dart';
 import '../../core/config/app_config.dart';
 import '../../core/net/app_error.dart';
 import '../../core/utils/logger.dart';
+import '../models/bili_user.dart';
 import '../models/content_item.dart';
 import '../models/subscription.dart';
 import 'bili_client.dart';
@@ -17,6 +18,8 @@ class BiliFetchResult {
     required this.fetchedAt,
     this.fromCache = false,
     this.emptyHint,
+    this.nextPage,
+    this.nextOffset,
   });
 
   final List<ContentItem> items;
@@ -27,6 +30,12 @@ class BiliFetchResult {
 
   /// 空结果的解释文案。
   final String? emptyHint;
+
+  /// 下一页**页码**（投稿路由用）。null = 该路由不用页码 / 已到底。
+  final int? nextPage;
+
+  /// 下一页 **offset**（动态路由用）。null = 到底或该路由不用 offset。
+  final String? nextOffset;
 }
 
 /// 一次「全部关注」动态流拉取的结果（含游标与是否到底）。
@@ -145,10 +154,19 @@ class BiliTimelineSource {
   }
 
   /// 拉取一个「B 站订阅源 × 路由」的内容。
+  ///
+  /// [page] / [offset] 是**翻页游标**（2026-11-08 新增）：
+  /// - 投稿路由（`bilibiliVideo`）用 [page]（接口参数 `pn`，1 起）；
+  /// - 动态路由（`bilibiliDynamic`）用 [offset]（接口参数 `offset`，首屏不传）。
+  ///
+  /// 早先这两个参数根本不存在，每个源永远只拉第一页 —— 这正是
+  /// 「精选订阅里更早的动态看不到」的根因（见 `SourceCursor` 的注释）。
   Future<BiliFetchResult> fetch({
     required Subscription sub,
     required FeedRoute route,
     bool forceRefresh = false,
+    int page = 1,
+    String? offset,
   }) async {
     final mid = int.tryParse(sub.uid.trim());
     if (mid == null || mid <= 0) {
@@ -163,7 +181,10 @@ class BiliTimelineSource {
     // notifier 被重建、已加载内容被清空 —— 那是更难查的一类问题。
     _requireLogin();
 
-    final cacheKey = _cacheKey(route, mid);
+    // ⚠️ 缓存键**必须**带上翻页游标：
+    // 只按 (route, mid) 缓存的话，翻到第 2 页时 TTL 内会直接命中第 1 页的
+    // 缓存，症状是「翻页后内容完全不变、滚不到更早的东西」。
+    final cacheKey = _cacheKey(route, mid, page: page, offset: offset);
 
     if (!forceRefresh) {
       final cached = await _cache.read(cacheKey, ignoreTtl: true);
@@ -176,7 +197,7 @@ class BiliTimelineSource {
         );
         Log.d(
           'BiliTimelineSource',
-          'mid=$mid ${route.key} 命中缓存：${items.length} 条',
+          'mid=$mid ${route.key} page=$page 命中缓存：${items.length} 条',
         );
         return BiliFetchResult(
           items: items,
@@ -187,7 +208,8 @@ class BiliTimelineSource {
       }
     }
 
-    final raw = await _fetchRaw(route, mid);
+    final rawPage = await _fetchRawPage(route, mid, page: page, offset: offset);
+    final raw = rawPage.items;
     final now = DateTime.now().toUtc();
 
     // 缓存原始 JSON 而不是解析后的模型：解析规则升级后旧缓存依然可用
@@ -199,21 +221,104 @@ class BiliTimelineSource {
       Log.w('BiliTimelineSource', '写缓存失败（忽略）：$e');
     }
 
-    final items = _parse(route: route, raw: raw, sub: sub, fetchedAt: now);
+    List<ContentItem> items =
+        _parse(route: route, raw: raw, sub: sub, fetchedAt: now);
+
+    // 投稿路由补头像（见 [BiliClient.userAvatar] 的注释：`vlist` 里没有 `face`）。
+    // 动态路由的 `module_author.face` 本来就有，不用走这一步。
+    if (route == FeedRoute.bilibiliVideo && items.isNotEmpty) {
+      items = await _attachAvatar(items, mid);
+    }
+
     // 这条日志是刻意留的：真机上出问题时，设置页的日志页能一眼看出
     // 到底是「服务端没给」还是「给了但没解析出来」。
     Log.d(
       'BiliTimelineSource',
-      'mid=$mid ${route.key} 拉取成功：原始 ${raw.length} 条 → 解析出 ${items.length} 条',
+      'mid=$mid ${route.key} page=$page 拉取成功：'
+      '原始 ${raw.length} 条 → 解析出 ${items.length} 条'
+      '${rawPage.nextOffset == null ? '' : ' 下一页 offset=${rawPage.nextOffset}'}',
     );
     return BiliFetchResult(
       items: items,
       fetchedAt: now,
       emptyHint: items.isEmpty ? _emptyHint(route) : null,
+      nextPage: rawPage.nextPage,
+      nextOffset: rawPage.nextOffset,
     );
   }
 
   // ------------------------------------------------------------ 内部
+
+  /// 给一批**投稿**条目补上 UP 主头像。
+  ///
+  /// 为什么需要：投稿接口（`arc/search`）的 `vlist[]` 只给 `author` + `mid`，
+  /// **没有 `face`**（真机缓存核实），所以 `fromUserVideo` 产出的
+  /// `authorAvatar` 恒为 null，卡片只能显示首字母占位。
+  ///
+  /// 三条纪律：
+  /// 1. **一个 UP 只问一次**：整批条目的 `authorId` 几乎都是同一个 mid，
+  ///    按 mid 去重后最多 1 个请求（这里再按 mid 命中一次内存缓存）；
+  /// 2. **失败绝不抛**：`userAvatar` 自己吞异常返回 null，这里保住原条目；
+  /// 3. **磁盘缓存 24 小时**：头像 URL 很少变，翻页时每页都问一次没有必要。
+  Future<List<ContentItem>> _attachAvatar(
+    List<ContentItem> items,
+    int mid,
+  ) async {
+    String? face = _avatarCache[mid];
+    if (face == null) {
+      const String key = 'bili-avatar://card';
+      face = await _readAvatarCache(mid, key);
+      if (face == null) {
+        final fetched = await _client.userAvatar(mid: mid);
+        if (fetched != null && fetched.isNotEmpty) {
+          face = BiliUser.normalizeImageUrl(fetched);
+          if (face != null) {
+            _avatarCache[mid] = face;
+            await _writeAvatarCache(mid, key, face);
+          }
+        }
+      } else {
+        _avatarCache[mid] = face;
+      }
+    }
+    if (face == null || face.isEmpty) return items;
+    return <ContentItem>[
+      for (final ContentItem item in items)
+        item.authorAvatar == null || item.authorAvatar!.isEmpty
+            ? item.copyWith(authorAvatar: face)
+            : item,
+    ];
+  }
+
+  /// 头像 URL 的内存缓存（同一进程内跨翻页复用）。
+  final Map<int, String> _avatarCache = <int, String>{};
+
+  Future<String?> _readAvatarCache(int mid, String prefix) async {
+    try {
+      final CachedBody? body = await _cache.read(
+        '$prefix/$mid',
+        ignoreTtl: true,
+      );
+      if (body == null) return null;
+      // 头像用**更长的 TTL**（24h）：URL 里带内容指纹，变了就换 URL 了。
+      if (DateTime.now().toUtc().difference(body.fetchedAt) >
+          const Duration(hours: 24)) {
+        return null;
+      }
+      final String text = body.body.trim();
+      return text.isEmpty ? null : text;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> _writeAvatarCache(int mid, String prefix, String url) async {
+    try {
+      await _cache.write('$prefix/$mid', url, statusCode: 200);
+    } catch (e) {
+      Log.w('BiliTimelineSource', '写头像缓存失败（忽略）：$e');
+    }
+  }
 
   /// 登录态检查抽成一处：逐源拉取与「全部关注」都要用，
   /// 两处各写一份很容易漏掉一处，症状是「未登录时静默返回空列表」。
@@ -263,12 +368,31 @@ class BiliTimelineSource {
     return out;
   }
 
-  Future<List<Object?>> _fetchRaw(FeedRoute route, int mid) {
+  /// 取一页原始数据，**同时返回下一页游标**。
+  ///
+  /// 两种路由的游标语义不同（页码 vs offset），所以用一个内部小结构
+  /// 一起带回来，而不是让调用方自己去猜「这一页还能不能翻」。
+  Future<_RawPage> _fetchRawPage(
+    FeedRoute route,
+    int mid, {
+    required int page,
+    String? offset,
+  }) async {
     switch (route) {
       case FeedRoute.bilibiliVideo:
-        return _client.userVideoItems(mid: mid);
+        // 投稿列表用页码翻页（`pn` 从 1 起）。
+        final items = await _client.userVideoItems(mid: mid, pn: page);
+        // 返回条数达到一页上限 = 可能还有下一页。
+        // 拿不满就不给下一页，避免「最后几页全是空请求」。
+        final bool mayHaveMore = items.length >= AppConfig.userVideoFetchLimit;
+        return _RawPage(
+          items: items,
+          nextPage: mayHaveMore ? page + 1 : null,
+        );
       case FeedRoute.bilibiliDynamic:
-        return _client.userDynamicItems(mid: mid);
+        // 动态用 offset 串翻页；服务端直接给下一页 offset（到底时为空）。
+        final p = await _client.userDynamicPage(mid: mid, offset: offset);
+        return _RawPage(items: p.items, nextOffset: p.nextOffset);
       case FeedRoute.weiboUser:
         throw AppError.parse('微博源不该走 B 站官方接口（内部路由分派错误）');
     }
@@ -300,8 +424,25 @@ class BiliTimelineSource {
         FeedRoute.weiboUser => '该微博源没有内容',
       };
 
-  static String _cacheKey(FeedRoute route, int mid) =>
-      'bili-api://${route.key}/$mid';
+  /// 逐源缓存键。
+  ///
+  /// ⚠️ 翻页之后**必须**把游标编进键里，否则第 2 页会命中第 1 页的缓存
+  /// （TTL 5 分钟内），症状是「翻页后内容完全不变」。
+  ///
+  /// 首屏（page=1 且无 offset）刻意**保持旧格式** `bili-api://{route}/{mid}`：
+  /// 设备上已有大量按这个键写入的缓存，改格式会让升级后的首次冷启动
+  /// 全部 miss、白拉一轮。只有翻页才用带后缀的新键。
+  static String _cacheKey(
+    FeedRoute route,
+    int mid, {
+    required int page,
+    String? offset,
+  }) {
+    final base = 'bili-api://${route.key}/$mid';
+    final off = (offset ?? '').trim();
+    if (page <= 1 && off.isEmpty) return base;
+    return '$base/page=$page/offset=$off';
+  }
 
   static List<Object?> _decode(String body) {
     try {
@@ -312,4 +453,17 @@ class BiliTimelineSource {
       return const <Object?>[];
     }
   }
+}
+
+/// 一页原始数据的内部载体：items + 下一页游标（二选一）。
+class _RawPage {
+  const _RawPage({required this.items, this.nextPage, this.nextOffset});
+
+  final List<Object?> items;
+
+  /// 投稿路由的下一页页码；null = 到底。
+  final int? nextPage;
+
+  /// 动态路由的下一页 offset；null = 到底。
+  final String? nextOffset;
 }

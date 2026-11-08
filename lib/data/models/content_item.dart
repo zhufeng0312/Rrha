@@ -174,6 +174,7 @@ class ContentItem {
     int? commentCount,
     int? likeCount,
     int? repostCount,
+    String? authorAvatar,
   }) =>
       ContentItem(
         id: id,
@@ -186,7 +187,9 @@ class ContentItem {
         link: link,
         fetchedAt: fetchedAt,
         authorId: authorId,
-        authorAvatar: authorAvatar,
+        // 头像可覆盖：B 站**投稿**接口的 `vlist[]` 不含 `face`，需要事后由
+        // `BiliTimelineSource` 补一次（见那里的 `_attachAvatar`）。
+        authorAvatar: authorAvatar ?? this.authorAvatar,
         coverUrl: coverUrl,
         images: images,
         origin: origin,

@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import '../core/cache/image_cache_store.dart';
 import '../core/config/app_config.dart';
 import '../core/theme/app_colors.dart';
+import '../core/utils/logger.dart';
 
 /// 带**磁盘**缓存的网络图片。
 ///
@@ -148,7 +149,14 @@ class _CachedImageState extends State<CachedImage> {
   Future<void> _downloadInBackground() async {
     if (!mounted) return;
     final cache = _cache;
-    if (cache == null) return;
+    if (cache == null) {
+      // ⚠️ 这里曾经静默 return：`ImageCacheScope` 没挂上时，所有图片都只能
+      // 走网络、永远不落盘，而界面上看不出任何异常（只是「每次都要重新加载」）。
+      // 2026-11-08 查「B 站头像不显示」时就是靠这条日志才排除了这条路径。
+      Log.w('CachedImage', '没有可用的 ImageCacheStore，跳过磁盘缓存：'
+          '${widget.url ?? ''}');
+      return;
+    }
     final file = await cache.fetchAndStore(_url);
     if (!mounted || file == null) return;
     // 落盘完成 → 换成 Image.file（顺带让这一张图不再依赖网络）。

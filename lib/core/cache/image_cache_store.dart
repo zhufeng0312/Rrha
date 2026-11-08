@@ -361,25 +361,65 @@ class ImageCacheStore {
         url,
         options: Options(
           responseType: ResponseType.bytes,
-          // B 站图床对 Referer 敏感，缺了会 403 —— 与 CoverImage 的请求头保持一致。
-          headers: const <String, String>{
-            'Referer': 'https://www.bilibili.com/',
+          // Referer **必须按图床域名分开**（2026-11-08 真机实测）：
+          // 微博图床（`*.sinaimg.cn`）对 B 站 Referer 直接返回 **403**
+          // （实测 size=304 的拒绝页），而对 `weibo.com` 返回 302 正常。
+          //
+          // 早先这里写死 `https://www.bilibili.com/`，后果是**所有微博图片
+          // 都下不下来**：目录建好了、索引也写了，但微博头像/封面永远是占位。
+          // 而 `DioFactory.createBiliDio()` 的 BaseOptions 里本来就带了
+          // B 站 Referer/Origin，这里必须显式覆盖，不能指望它按域名自适应。
+          headers: <String, String>{
+            'Referer': refererFor(url),
             'User-Agent': AppConfig.browserUserAgent,
           },
         ),
       );
       final status = resp.statusCode ?? 0;
-      if (status < 200 || status >= 300) return null;
+      if (status < 200 || status >= 300) {
+        // ⚠️ 这里必须**记日志**：`createBiliDio()` 的 validateStatus 放宽到
+        // `<500 都算正常响应`，于是 403 不会抛异常，只会静默走到这条
+        // return null —— 图片永远不落盘，界面上只看到占位，却没有任何线索。
+        // 2026-11-08 的微博头像问题就是这样被藏了很久。
+        Log.w(
+          'ImageCacheStore',
+          '下载图片被拒绝 HTTP $status ${_short(url)}',
+        );
+        return null;
+      }
       final data = resp.data;
       if (data == null || data.isEmpty) return null;
       return await put(url, Uint8List.fromList(data));
     } on DioException catch (e) {
-      Log.w('ImageCacheStore', '下载图片失败 ${_short(url)}: ${e.type}');
+      Log.w('ImageCacheStore', '下载图片失败 ${_short(url)}: ${e.type} ${e.message}');
       return null;
     } catch (e) {
       Log.w('ImageCacheStore', '下载图片失败 ${_short(url)}: $e');
       return null;
     }
+  }
+
+  /// 按图床域名挑 Referer。
+  ///
+  /// 两条规则都有**真机实测**依据，不要凭直觉简化成「都用 B 站」：
+  /// - `*.sinaimg.cn` / 微博域名 → `https://weibo.com/`（B 站 Referer 会 403）；
+  /// - 其余（`*.hdslb.com` 等）→ `https://www.bilibili.com/`。
+  ///
+  /// 与 `CachedImage._refererFor` 保持同一份判断。**刻意不抽公共函数**：
+  /// 那个是 widget 的静态私有方法，而这里是缓存层，两边生命周期不同；
+  /// 真要合并应放进 `AppConfig`，那属于跨模块改动，不在本轮范围。
+  static String refererFor(String url) {
+    final String lower = url.toLowerCase();
+    const List<String> weiboHosts = <String>[
+      'sinaimg.cn',
+      'sinaimg.com',
+      'weibo.cn',
+      'weibo.com',
+    ];
+    for (final String host in weiboHosts) {
+      if (lower.contains(host)) return 'https://weibo.com/';
+    }
+    return 'https://www.bilibili.com/';
   }
 
   /// 直接把已知的字节写进缓存（全屏预览页保存图片前先落盘，避免重复下载）。

@@ -40,4 +40,42 @@ class DioFactory {
     dio.interceptors.add(RetryInterceptor(dio: dio));
     return dio;
   }
+
+  /// **图片下载专用**的 Dio。
+  ///
+  /// ## 为什么不能复用 [createBiliDio]
+  ///
+  /// [createBiliDio] 的 BaseOptions 里写死了 B 站专属请求头：
+  /// `Origin: https://www.bilibili.com`、`Accept: application/json`、
+  /// `Referer: https://www.bilibili.com/`。
+  /// 而图片缓存要同时下载 **B 站图床与微博图床** 的图片：
+  ///
+  /// - 微博图床（`*.sinaimg.cn`）收到 B 站 Referer **直接 403**
+  ///   （2026-11-08 真机实测：`status=403 size=304`；换成 `weibo.com` 则 302 正常）；
+  /// - `Accept: application/json` 对取图片没有意义，个别 CDN 还会按其做内容协商。
+  ///
+  /// 所以这里给一个**干净**的 Dio：不设 `baseUrl`（图片一律用绝对地址）、
+  /// 不带 `Origin`/`Accept`、`validateStatus` 收回到「2xx/3xx 才算成功」，
+  /// 让 4xx 直接抛 `DioException` —— 缓存层因此能在日志里看见失败原因，
+  /// 而不是像之前那样被 `<500` 静默吞成一个 null。
+  ///
+  /// Referer 由调用方（`ImageCacheStore.refererFor`）**按域名**逐个设置。
+  static Dio createImageDio() {
+    final dio = Dio(
+      BaseOptions(
+        connectTimeout: AppConfig.connectTimeout,
+        receiveTimeout: AppConfig.receiveTimeout,
+        sendTimeout: AppConfig.sendTimeout,
+        responseType: ResponseType.bytes,
+        followRedirects: true,
+        headers: <String, String>{
+          'User-Agent': AppConfig.browserUserAgent,
+        },
+        validateStatus: (int? status) =>
+            status != null && status >= 200 && status < 400,
+      ),
+    );
+    dio.interceptors.add(RetryInterceptor(dio: dio));
+    return dio;
+  }
 }

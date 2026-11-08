@@ -97,6 +97,64 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
   Duration _position = Duration.zero;
   double? _scrubValue;
 
+  /// 视频区的**连续**折叠进度：0 = 完全展开，1 = 完全收起。
+  ///
+  /// 交互来自用户 2026-11-08 的明确要求（原型
+  /// `deepseek_html_20261108_d7d2d2.html` + 当轮口述）：
+  ///
+  /// > 「视频收起和放出的时候要有一个视频窗口**逐渐**缩小或放大的过程，
+  /// >   而标题和简介这些处于视频和评论区之间的则随着滑动的过程**正常地**
+  /// >   划到上边或下边」
+  ///
+  /// 所以这里**不是一个 bool**：视频高度随评论区的滚动比例线性收缩，
+  /// 手指每滑一点视频就小一点 —— 而不是「滑满 20px 就整块消失」。
+  ///
+  /// 早先的实现是 bool + `AnimatedSize`，真机上表现为「一下子跳没了」，
+  /// 与用户要的「逐渐缩小」不符。
+  double _collapseProgress = 0;
+
+  /// 折叠完成所需的滚动距离（px）。
+  ///
+  /// 取 220：16:9 视频在 6.1 寸屏上约 190~210px 高，这个值让
+  /// 「视频高度降到 0」与「手指滑过一屏视频的高度」大致同步，
+  /// 手感接近 B 站本体「上滑把播放器顶出屏幕」。
+  static const double _collapseDistance = 220;
+
+  /// 评论区滚动监听：把滚动距离换算成 [_collapseProgress]。
+  ///
+  /// ⚠️ 监听的是**评论区自己的** `ScrollController`（`CommentSection` 内部持有），
+  /// 所以这里用 `NotificationListener<ScrollNotification>` 在
+  /// [_lowerSection] 外层捕获，而不是去拿一个我们拿不到的 controller。
+  ///
+  /// **只在暂停时生效**：播放中收起视频等于让用户听声音看不到画面，
+  /// 与「把屏幕让给评论」的初衷相反 —— 播放时用户本来就想看画面。
+  bool _onCommentScroll(ScrollNotification n) {
+    // 播放中一律保持完全展开（进度归零）。
+    if (_playing) {
+      if (_collapseProgress != 0) setState(() => _collapseProgress = 0);
+      return false;
+    }
+    final double offset = n.metrics.pixels;
+    // 线性映射；滚回顶部时进度自然退回 0（视频放大回来）。
+    final double next =
+        (offset / _collapseDistance).clamp(0.0, 1.0).toDouble();
+    // 只在变化足够明显时才 setState：滚动通知每帧都来，
+    // 无差别 setState 会让整页每帧重建（评论区很重，会明显掉帧）。
+    if ((next - _collapseProgress).abs() < 0.01) return false;
+    setState(() => _collapseProgress = next);
+    return false;
+  }
+
+  /// 播放状态变化时，若开始播放就立刻把视频放大回来。
+  ///
+  /// 场景：暂停 → 上滑折叠 → 用户点播放（评论区里的「播放」入口）→
+  /// 视频必须回来，否则他按了播放却看不到画面。
+  void _syncCollapseWithPlayState(bool playing) {
+    if (playing && _collapseProgress != 0) {
+      setState(() => _collapseProgress = 0);
+    }
+  }
+
   /// 当前倍速（1.0 = 原速）。
   ///
   /// 与播放器的 `speed` 保持一致：长按期间是 [longPressSpeed]，松手回到
@@ -523,6 +581,8 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       if (!mounted) return;
       _clock.setPlaying(playing);
       setState(() => _playing = playing);
+      // 开始播放 → 视频必须立刻回来（用户按了播放却看不到画面是不可接受的）。
+      _syncCollapseWithPlayState(playing);
     });
     _durationSub = player.durationStream.listen((d) {
       if (!mounted) return;
@@ -1100,10 +1160,119 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       ),
       body: Column(
         children: <Widget>[
-          AspectRatio(aspectRatio: 16 / 9, child: _playerStack(settings)),
-          Expanded(child: _lowerSection()),
+          // ---------------------------------------------------------------
+          // 顶部区（视频 + 标题简介）：随评论区滚动**连续**收缩、放大。
+          //
+          // 用户 2026-11-08 的原始要求（逐字）：
+          // > 「视频收起和放出的时候要有一个视频窗口**逐渐**缩小或放大的过程，
+          // >   而标题和简介这些处于视频和评论区之间的则随着滑动的过程
+          // >   **正常地**划到上边或下边」
+          //
+          // 所以这里**不能**用 `AnimatedSize` + bool：那是「滑满阈值就整块
+          // 跳没」，真机上观感是闪一下。改为高度直接由 [_collapseProgress]
+          // 线性驱动 —— 手指每滑一点，视频就小一点，标题简介持续往上退，
+          // 滑到底（progress=1）时屏幕上只剩评论。
+          //
+          // 视频用真实高度收缩（不是 `Transform.scale`）：播放器容器变小，
+          // 画面按 `BoxFit` 适配，缩放过程不会出现「画面溢出到评论上」。
+          _topSection(settings),
+          Expanded(
+            child: NotificationListener<ScrollNotification>(
+              onNotification: _onCommentScroll,
+              child: _lowerSection(),
+            ),
+          ),
         ],
       ),
+    );
+  }
+
+  /// 顶部的「视频 + 标题简介」合并区，高度随 [_collapseProgress] 线性收缩。
+  ///
+  /// 两块的收缩**错开**，让「视频先缩、标题随后退走」这个顺序读起来自然：
+  /// - 视频：[0, 0.7] 区间内收到 0（用户最想先腾出画面）；
+  /// - 头部：[0.3, 1] 区间内收到 0（标题简介随后滚出屏幕）。
+  ///
+  /// 两段都完全由滚动位置决定，没有 `AnimatedSize` 的补间，所以来回滑动时
+  /// 视频放大/缩小的过程与手指严格同步 —— 这正是用户要的「逐渐」。
+  Widget _topSection(SettingsState settings) {
+    if (_info == null) {
+      // 信息还没回来：只显示视频占位，保持页面结构稳定不跳动。
+      return AspectRatio(
+        aspectRatio: 16 / 9,
+        child: _playerStack(settings),
+      );
+    }
+
+    final double videoBase =
+        MediaQuery.sizeOf(context).width * 9 / 16;
+    final double p = _collapseProgress;
+
+    // 视频：0 → 0.7 收完。
+    final double videoProgress = (p / 0.7).clamp(0.0, 1.0).toDouble();
+    final double videoHeight = videoBase * (1 - videoProgress);
+
+    // 头部：0.3 → 1 收完（起点晚于视频，形成「先缩视频、后退标题」的次序）。
+    final double headerProgress =
+        ((p - 0.3) / 0.7).clamp(0.0, 1.0).toDouble();
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        if (videoHeight > 0.5)
+          SizedBox(
+            height: videoHeight,
+            width: double.infinity,
+            child: _playerStack(settings),
+          ),
+        _collapsibleHeader(headerProgress),
+      ],
+    );
+  }
+
+  /// 标题 / 元信息 / 简介 / 统计行 / 分P：随滚动从下往上退出屏幕。
+  ///
+  /// 用「高度上限 × (1 - progress)」+ `ClipRect` 实现，而不是 `Transform`：
+  /// 前者会真的把空间还给评论区（列表高度随之变大，用户能一直往上滑），
+  /// 后者只是视觉位移，评论区高度不变，滑到底会留着一条空白。
+  Widget _collapsibleHeader(double progress) {
+    final info = _info;
+    if (info == null) return const SizedBox.shrink();
+    if (progress >= 1) return const SizedBox.shrink();
+
+    return LayoutBuilder(
+      builder: (BuildContext context, BoxConstraints c) {
+        // 头部基准高度。取屏高的 34%：6.1 寸机上标题 2 行 + 元信息 + 3 行
+        // 简介 + 统计行 + 分P 大约就是这个量级，再高会把评论挤没。
+        // 这里只用于**上限**，内容本身更矮时按实际高度显示。
+        final double base =
+            MediaQuery.sizeOf(context).height * 0.34;
+        final double maxH = base * (1 - progress);
+        if (maxH <= 0) return const SizedBox.shrink();
+
+        // ⚠️ `ClipRect` + `ConstrainedBox(maxHeight:)` 的默认对齐是**居中**，
+        // 结果是「上下同时被裁」，标题会从中间开始消失。
+        // 用户要的是「正常地划到上边去」，所以必须 `alignment: topCenter` ——
+        // 保留顶部、裁掉底部，视觉上就是内容一路往上退出屏幕。
+        return ClipRect(
+          child: Align(
+            alignment: Alignment.topCenter,
+            heightFactor: 1,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxHeight: maxH),
+              child: SingleChildScrollView(
+                // 头部自己的滚动彻底禁用：它是被「折叠」的，不是被用户滚的。
+                // 留着可滚动会让手势落到这里，表现为「往上滑评论不动」。
+                physics: const NeverScrollableScrollPhysics(),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
+                  child: _header(info),
+                ),
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 
@@ -1113,44 +1282,24 @@ class _PlayerPageState extends ConsumerState<PlayerPage>
       return const Center(child: CircularProgressIndicator());
     }
 
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        // 头部（标题 / 元信息 / 简介 / 统计行 / 分P）**不能无限增高**：
-        // 它下面是把剩余高度全吃掉的评论区，头部一旦超了就会在 6.1 寸机器上
-        // RenderFlex overflow（§4.3 明确提醒过）。这里给头部设个上限，
-        // 超出时头部自己内部滚动 —— 页面结构不变，小屏也不会崩。
-        final maxHeader = constraints.maxHeight * 0.52;
-
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-            ConstrainedBox(
-              constraints: BoxConstraints(maxHeight: maxHeader),
-              child: SingleChildScrollView(
-                child: Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
-                  child: _header(info),
-                ),
-              ),
-            ),
-            const Divider(height: 1),
-            // 视频评论：oid = aid，type = 1（与动态评论共用同一个组件）。
-            // 这个 key 是统计行「点评论滚过去」的锚点。
-            Expanded(
-              child: CommentSection(
-                key: _commentAnchorKey,
-                oid: '${info.aid}',
-                upMid: info.ownerMid,
-              ),
-            ),
-          ],
-        );
-      },
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        const Divider(height: 1),
+        // 视频评论：oid = aid，type = 1（与动态评论共用同一个组件）。
+        // 这个 key 是统计行「点评论滚过去」的锚点。
+        Expanded(
+          child: CommentSection(
+            key: _commentAnchorKey,
+            oid: '${info.aid}',
+            upMid: info.ownerMid,
+          ),
+        ),
+      ],
     );
   }
 
   /// 播放页头部：标题 → UP 主/时长/播放数 → 简介 → 统计行 → 分 P。
-  ///
   /// 顺序刻意按 B 站本体的信息架构排（§4.3 的建议）：
   /// 用户肌肉记忆一致，「想看的数字在哪」不用重新学一遍。
   Widget _header(BiliVideoInfo info) {

@@ -89,6 +89,17 @@ app.*.map.json
 /tools/tmp/
 *.pyc
 
+# 探针脚本抓取的接口缓存（真实 API 响应，含动态 id 等）。
+# 它只是「为了不重复打接口」的本地临时文件，不是源码，也不该公开。
+/tools/_cache/
+
+# 临时输出：测试日志、adb 抓取、调试导出。
+# 下列模式覆盖 `tools/_t2.txt`、`tools/_t2e.txt` 这类随手重定向出来的文件 ——
+# 它们没有长期价值，但一旦进了仓库就会一直被 clone 下去。
+/tools/_*.txt
+/tools/*_out.txt
+/tools/*_err.txt
+
 # 本地备份文件（如精简文档前留的全文备份），不进仓库
 *.bak
 *.orig

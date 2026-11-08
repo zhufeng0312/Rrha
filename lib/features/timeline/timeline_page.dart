@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 // `RenderSliverMultiBoxAdaptor` / `SliverMultiBoxAdaptorParentData` 在
 // rendering 库里（material 不导出它们）。锚点定位要直接读 sliver 的布局结果。
@@ -26,7 +28,15 @@ import 'weibo_facade_card.dart';
 ///   （B 站 offset / 微博 since_id），一侧到底另一侧仍可继续翻；
 /// - **精选订阅**：按「订阅源 × 路由」逐个聚合（原有逻辑，保留不变）。
 class TimelinePage extends ConsumerStatefulWidget {
-  const TimelinePage({super.key});
+  const TimelinePage({super.key, this.onSwipePastEnd});
+
+  /// 内层两种模式都翻到头之后、用户还继续往右滑时的回调。
+  ///
+  /// 参数：-1 = 想往左去，+1 = 想往右去。由 [HomeShell] 接过去切到外层页面
+  /// （时间线 → 订阅源 → 设置）。
+  ///
+  /// 为 null 时（单测 / 单独挂载本页）完全不生效，本页行为与以前一致。
+  final ValueChanged<int>? onSwipePastEnd;
 
   /// 需要显示占位卡的微博订阅 = 那些「本轮没拉到任何内容」的源。
   ///
@@ -146,7 +156,16 @@ class _TimelinePageState extends ConsumerState<TimelinePage> {
 
   /// 锚点定位专用 key —— 挂在 `ListView` 的**外层**（`KeyedSubtree`），
   /// 因为 `ListView` 自己的 `key` 已经被 `PageStorageKey` 占用。
-  final GlobalKey _listKey = GlobalKey(debugLabel: 'timeline-list');
+  ///
+  /// ⚠️ **按模式各一个**（2026-11-08）：切模式时加了滑动过渡，新旧两屏会
+  /// 短暂**同时存在**。如果这里还是单个 `GlobalKey`，两棵树会在同一帧里
+  /// 争用它 —— 直接抛 `Duplicate GlobalKey` 崩溃。
+  final Map<TimelineMode, GlobalKey> _listKeys = <TimelineMode, GlobalKey>{};
+
+  GlobalKey _listKeyFor(TimelineMode mode) => _listKeys.putIfAbsent(
+        mode,
+        () => GlobalKey(debugLabel: 'timeline-list-${mode.key}'),
+      );
 
   /// 遍历列表的 sliver，回调每个「条目」child 的 `(itemId, screenTop)`。
   ///
@@ -157,7 +176,8 @@ class _TimelinePageState extends ConsumerState<TimelinePage> {
     int facadeCount,
     void Function(String id, double screenTop) visit,
   ) {
-    final RenderObject? root = _listKey.currentContext?.findRenderObject();
+    final RenderObject? root =
+        _listKeyFor(state.mode).currentContext?.findRenderObject();
     if (root == null) return;
 
     RenderSliverMultiBoxAdaptor? sliver;
@@ -375,12 +395,153 @@ class _TimelinePageState extends ConsumerState<TimelinePage> {
       // 缓存时间还在用），只是时间线页面不再展示它。
       body: Column(
         children: <Widget>[
-          _ModeSwitch(mode: state.mode, onChanged: notifier.setMode),
+          // 点顶部按钮切换也走带方向的动画（与左右滑同一条路径，
+          // 保证两种入口看到的过渡完全一致）。
+          _ModeSwitch(mode: state.mode, onChanged: _switchMode),
           if (state.partialFailure) _DegradedBanner(state: state),
-          Expanded(child: _body(context, ref, state)),
+          Expanded(
+            child: GestureDetector(
+              // ---------------------------------------------------------------
+              // 横向切模式 + 到边缘后交给外层（2026-11-08 用户需求）。
+              //
+              // 「全部关注」→右滑→「精选订阅」→再右滑→订阅源→再右滑→设置。
+              //
+              // ⚠️ 必须 `behavior: translucent`：列表本身要能接纵向拖动与点击，
+              // 这里只**额外**接一份横向拖动，不能把事件吞掉。
+              //
+              // ⚠️ 必须只在「快速横向轻扫」时才切：否则用户横向滑一点点
+              // （比如滑动删除图片、水平相册）也会把模式切走。
+              behavior: HitTestBehavior.translucent,
+              onHorizontalDragEnd: (DragEndDetails d) {
+                final double v = d.primaryVelocity ?? 0;
+                if (v.abs() < 320) return; // 轻扫阈值：明显快于普通拖动才算切页
+                final bool wantRight = v < 0; // 手指左滑 = 想看右边
+                if (wantRight) {
+                  // 时间线只有两档：全部关注(0) → 精选订阅(1) → 交给外层。
+                  if (state.mode == TimelineMode.allFollowing) {
+                    _switchMode(TimelineMode.selectedSubscriptions);
+                  } else {
+                    widget.onSwipePastEnd?.call(1);
+                  }
+                } else {
+                  // 往左：精选订阅 → 全部关注；已在最左则不动（左边没有页）。
+                  if (state.mode == TimelineMode.selectedSubscriptions) {
+                    _switchMode(TimelineMode.allFollowing);
+                  }
+                }
+              },
+              child: _modeTransition(state, ref),
+            ),
+          ),
         ],
       ),
     );
+  }
+
+  /// 两档模式的切换动画（2026-11-08 用户要求）。
+  ///
+  /// ## 需求
+  ///
+  /// > 「全部关注和精选订阅之间翻动没有切换动画。我需要和时间线与订阅源之间
+  /// >   切换一样的切换动画」
+  ///
+  /// 外层三个页是 `PageView.animateToPage`（真·横向平移），所以这里也用
+  /// **横向平移**，方向和位移都对得上，两级切换看起来是同一个手势的延续。
+  ///
+  /// ## 为什么用 `AnimatedSwitcher` 而不是内层再塞一个 `PageView`
+  ///
+  /// 内层如果也用 `PageView`，列表就会被套在横向滚动容器里，
+  /// 与卡片的横向手势（图片预览等）抢 gesture arena —— 这正是外层当初
+  /// 关掉默认手势的原因。`AnimatedSwitcher` 只在**切换的那 260ms** 同时挂
+  /// 两棵树，平时仍然只有一棵，不引入任何常驻的横向 Scrollable。
+  ///
+  /// 切换方向由 [_transitionDirection] 决定：往右边那页切 = 新页从右侧滑入。
+  Widget _modeTransition(TimelineState state, WidgetRef ref) {
+    final Duration duration = const Duration(milliseconds: 260);
+
+    return AnimatedSwitcher(
+      duration: duration,
+      // 旧页必须**等新页进来才走**：直接 `child` 优先会看到两屏重叠。
+      switchInCurve: Curves.easeOutCubic,
+      switchOutCurve: Curves.easeOutCubic,
+      layoutBuilder: (Widget? current, List<Widget> previous) {
+        // 关键：旧页与新页**同时**参与布局，且都铺满整个区域。
+        // 默认的 `layoutBuilder` 会把它们堆在 `Stack` 里但不保证顺序，
+        // 这里显式指定「旧的下、新的上」，滑入的那一页才不会被旧页盖住。
+        return Stack(
+          alignment: Alignment.topCenter,
+          children: <Widget>[
+            ...previous,
+            if (current != null) current,
+          ],
+        );
+      },
+      transitionBuilder: (Widget child, Animation<double> animation) {
+        // 判定「是不是新页」：`child.key == ValueKey(mode)`。
+        final bool isCurrent =
+            (child.key as ValueKey<TimelineMode>?)?.value == state.mode;
+
+        // ## 位移方向怎么算才对
+        //
+        // `Tween(begin, end).animate(animation)` 的映射是：
+        // `animation == 0` → `begin`，`animation == 1` → `end`。
+        //
+        // - **新页**：animation 0 → 1。希望「从侧面进入原位」：
+        //   `begin = +direction*1.0`、`end = 0`。
+        // - **旧页**：animation **1 → 0**（`AnimatedSwitcher` 让旧页反向跑）。
+        //   希望「从原位退向另一侧」：animation==1 时在 0、animation==0 时在
+        //   `-direction*1.0`，也就是 `begin = -direction*1.0`、`end = 0`。
+        //
+        // 两者共用 `end = 0`，只有 `begin` 的符号相反 —— 于是两页朝同一个
+        // 方向平移（新页从右侧推入、旧页被推向左侧），与外层 `PageView`
+        // 的观感一致。
+        //
+        // ⚠️ 位移量用 **1.0**（整屏宽），不是 0.28：
+        // 早先用 0.28 时两层会大面积重叠，两张卡片的内容互相透出来，
+        // 真机观感是「双重曝光」而不是「翻页」。整屏位移才是硬滑 ——
+        // 旧页完全退出画面后新页才顶上来，与 `PageView` 完全一致。
+        final double beginX = isCurrent
+            ? _transitionDirection * 1.0
+            : -_transitionDirection * 1.0;
+
+        return SlideTransition(
+          position: Tween<Offset>(
+            begin: Offset(beginX, 0),
+            end: Offset.zero,
+          ).animate(animation),
+          // **不做淡入淡出**：`PageView` 的切换是不透明的硬滑，
+          // 加 `FadeTransition` 会让两屏同时半透明，看起来是叠影。
+          // 这里靠位移 + 不透明背景完全覆盖旧页。
+          child: ColoredBox(
+            // 必须给不透明底色：列表本身有透明段（卡片之间的间隙能透出
+            // 下层 Scaffold 的颜色），否则滑入过程中会看到旧页从缝隙里透出来。
+            color: Theme.of(context).scaffoldBackgroundColor,
+            child: child,
+          ),
+        );
+      },
+      child: KeyedSubtree(
+        key: ValueKey<TimelineMode>(state.mode),
+        child: _body(context, ref, state),
+      ),
+    );
+  }
+
+  /// 最近一次切换的**方向**：+1 = 往右翻（去「精选订阅」），-1 = 往左翻。
+  ///
+  /// 供 [_modeTransition] 决定新页从哪一侧滑入。初始为 +1（默认往右）。
+  double _transitionDirection = 1;
+
+  /// 带方向地切换模式。
+  ///
+  /// 所有切换入口（点顶部按钮、左右滑）都走这里，保证**动画方向与实际
+  /// 翻动方向一致** —— 否则往左滑却看到内容从右边进来，手势会很别扭。
+  void _switchMode(TimelineMode target) {
+    final TimelineMode current = ref.read(timelineProvider).mode;
+    if (current == target) return;
+    // 顺序即 `TimelineMode.values`：allFollowing(0) → selectedSubscriptions(1)。
+    _transitionDirection = target.index > current.index ? 1 : -1;
+    unawaited(ref.read(timelineProvider.notifier).setMode(target));
   }
 
   Widget _body(BuildContext context, WidgetRef ref, TimelineState state) {
@@ -441,7 +602,7 @@ class _TimelinePageState extends ConsumerState<TimelinePage> {
         // 锚点定位要用这个 key 找到列表的 RenderObject 去遍历 sliver。
         // 挂在 `ListView` **外层**：列表自己的 key 已被 `PageStorageKey` 占用。
         child: KeyedSubtree(
-          key: _listKey,
+          key: _listKeyFor(state.mode),
           child: ListView.separated(
           // ⚠️ `key` + `controller` 是「两种模式滚动互不影响」的关键，两者都**不能删**：
           // - `controller:`（每个模式一个）：把列表从共享的 PrimaryScrollController
@@ -530,9 +691,24 @@ class _TimelinePageState extends ConsumerState<TimelinePage> {
     );
   }
 
-  /// 底部状态：加载下一页 / 到底提示（只对分页模式有意义）。
+  /// 底部状态：加载下一页 / 到底提示。
+  ///
+  /// 两种模式**都要**有（2026-11-08 起「精选订阅」也支持翻页了）。
+  /// 早先这里 `if (!state.mode.isPaged) return SizedBox.shrink()`，
+  /// 结果精选订阅滚到底时完全没有反馈，用户以为列表卡住了。
   Widget _footer(TimelineState state) {
-    if (!state.mode.isPaged) return const SizedBox.shrink();
+    if (!state.loadingMore && !state.canLoadMore) {
+      // 到底了：给一句明确的收尾（两种模式一致）。
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 18),
+        child: Center(
+          child: Text(
+            '已经到底了',
+            style: TextStyle(fontSize: 12, color: AppColors.textSecondary),
+          ),
+        ),
+      );
+    }
 
     if (state.loadingMore) {
       return const Padding(
@@ -547,12 +723,12 @@ class _TimelinePageState extends ConsumerState<TimelinePage> {
       );
     }
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 18),
+    return const Padding(
+      padding: EdgeInsets.symmetric(vertical: 18),
       child: Center(
         child: Text(
-          state.followingHasMore ? '上滑加载更多' : '已经到底了',
-          style: const TextStyle(fontSize: 12, color: AppColors.textSecondary),
+          '上滑加载更多',
+          style: TextStyle(fontSize: 12, color: AppColors.textSecondary),
         ),
       ),
     );
