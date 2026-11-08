@@ -20,12 +20,12 @@
 > - 游客票据拿到的 `SUB` 落在 **`.weibo.com`**，与 `m.weibo.cn` 是**不同域**，根本不会送达。
 >
 > **最终方案**：按第 4 节「退路 4」——**降级为内置 WebView 打开**，已真机验证能渲染真实微博页面
-> （`_warma_` 主页，粉丝 101.9万）。实现细节、探针原始数据、两个真机缺陷的修复过程，
+> （某个公开博主的主页，能渲染出真实内容）。实现细节、探针原始数据、两个真机缺陷的修复过程，
 > 全部记录在 **`docs/HANDOVER.md` §7.12**；本文档保留了当时的探测过程，作为**历史依据**。
 >
 > **2026-10-18 更新（推翻上面的悲观结论）**：登录态下接口**是可用的**。
 > 用户在应用内 WebView 登录微博后，读取 `CookieManager.getCookie("https://m.weibo.cn")`，
-> 用**普通 Dio 请求**打 `container/getIndex?containerid=1076031782488734` → **HTTP 200、11 条卡片**。
+> 用**普通 Dio 请求**打 `container/getIndex?containerid=107603<uid>` → **HTTP 200、11 条卡片**。
 > 所以 432 的真正成因是**游客 cookie 域不匹配**（`SUB` 在 `.weibo.com`，到不了 `m.weibo.cn`），
 > **不是** TLS 指纹或接口级封禁。详见 `docs/HANDOVER.md` §7.15 `十`。
 > **2026-10-18 已完成**：微博已接成**原生数据源**（客户端/解析/时间线全部落地，真机验证通过），
@@ -52,9 +52,9 @@
 | `lib/data/models/content_item.dart` | 统一模型（已含 `Platform.weibo`、`images`、`origin`、`videoRef.directVideoUrl`） |
 | `lib/features/comments/comment_section.dart` | 现状：**B 站专用**，接微博评论前必须抽象（见第 5 节） |
 
-## 3. 指定测试博主（本次新增要求）
+## 3. 测试对象
 
-**微博 UID：`1782488734`**
+**指定一个固定的微博 UID 作为测试对象**（具体值由维护者本地指定，不进仓库）。
 
 - 需要在 App 内**浏览微博内容时优先订阅**该博主；
 - **测试动态（图文）与视频时，优先使用该博主的内容**；
@@ -120,7 +120,7 @@
 ## 8. 推进顺序（探针优先，别一上来写 Flutter 代码）
 
 1. **先写 Python 探针**（放 `D:\Rrha\.env\`，属 gitignore 区）。第一件事就是让
-   `/api/container/getIndex` 对 UID `1782488734` 返回 200 —— 这是全模块的地基。
+   `/api/container/getIndex` 对目标 UID 返回 200 —— 这是全模块的地基。
 2. 拿到真实响应后，**打印结构与字段名/类型**（`cards[].mblog` 的 `text`/`pics`/`retweeted_status`/`page_info`/`created_at`），
    不要只看一眼 200 就动手。
 3. 把结论固化成一张「字段实测表」写进 `HANDOVER`（§7.7/§7.8 有范例）。
@@ -169,18 +169,18 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 ## 附录：本次接口实测原始记录（2026-10-17）
 
-测试对象 UID `1782488734`；客户端分别是 Python `urllib`（OpenSSL）与 `curl 8.22`（Schannel），**两者结果一致**，因此可排除「TLS 指纹差异」这一解释。
+测试对象为某个已登录的微博 UID；客户端分别是 Python `urllib`（OpenSSL）与 `curl 8.22`（Schannel），**两者结果一致**，因此可排除「TLS 指纹差异」这一解释。
 
 | # | 请求 | 结果 |
 | --- | --- | --- |
 | 1 | `GET https://m.weibo.cn/`（首页） | **200**（拿到 `WEIBOCN_FROM` cookie） |
 | 2 | `POST https://passport.weibo.com/visitor/genvisitor`（`cb=gen_callback&fp={"os":"1",...}`） | **200** → `{"retcode":20000000,"msg":"succ","data":{"tid":"01ASvUpv...","new_tid":true}}` ✅ 游客票据可获取 |
 | 3 | `GET https://passport.weibo.com/visitor/visitor?a=incarnate&t=<tid>&w=2&c=095&cb=cross_domain&from=weibo` | **200** → Set-Cookie 写入 `SUB` / `SUBP` / `SVB` / `SRT` / `SRF` ✅ 游客身份建立成功 |
-| 4 | `GET https://m.weibo.cn/api/container/getIndex?type=uid&value=1782488734&containerid=1076031782488734`（带游客 Cookie + `Referer`/`X-Requested-With`/`MWeibo-Pwa`） | **432**，响应体为空 ❌（被拦，**这是当前主要阻塞点**） |
+| 4 | `GET https://m.weibo.cn/api/container/getIndex?type=uid&value=<uid>&containerid=107603<uid>`（带游客 Cookie + `Referer`/`X-Requested-With`/`MWeibo-Pwa`） | **432**，响应体为空 ❌（被拦，**这是当前主要阻塞点**） |
 | 5 | 同上，但 `containerid=102803`（热门流，不涉 UID） | **432** ❌ → 说明是**该接口级别**的风控，不是「这个博主」的问题 |
 | 6 | `GET https://m.weibo.cn/api/config` | **200** → `{"data":{"login":false,"st":"3b161a",...}}` ✅ 注意到了 `st` 令牌与 `login:false` |
 | 7 | `GET https://m.weibo.cn/api/statuses/show?id=5000000000000000`（假 id） | **200**（接口可用，只是数据不存在）✅ |
-| 8 | `GET https://weibo.com/ajax/statuses/mymblog?uid=1782488734&page=1&feature=0` | **403** ❌（需要登录态） |
+| 8 | `GET https://weibo.com/ajax/statuses/mymblog?uid=<uid>&page=1&feature=0` | **403** ❌（需要登录态） |
 
 **由此得到的判断**：
 

@@ -124,7 +124,7 @@ IconTheme.merge(
 
 - `lib/data/models/subscription.dart:67-75` 的 `displayName`：有 `alias` 用 alias，否则 B 站回 `'B 站 UP $uid'`、微博回 `'微博 $uid'`；
 - **B 站不受影响**：从关注列表导入时已经写了 `alias: user.displayName`（`following_import_sheet.dart:146`）；
-- **微博受影响**：微博是手动填 UID 添加的，`alias` 为 null → 显示成 `'微博 1782488734'`。
+- **微博受影响**：微博是手动填 UID 添加的，`alias` 为 null → 显示成 `'微博 <uid>'`（用户看到的是数字 ID，不是博主名）。
 
 **修法（我这边做，零额外请求）**：微博时间线拉回数据后，若某微博订阅 `alias` 为空，用该源第一条内容的 `authorName` 回填 alias（数据已经在手上了）。若要"添加时就显示名字"，则需在添加时请求一次博主信息——**这是额外请求，我倾向不这么做**。
 
